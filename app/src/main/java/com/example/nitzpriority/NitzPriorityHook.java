@@ -1,0 +1,427 @@
+package com.example.nitzpriority;
+
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+
+public final class NitzPriorityHook implements IXposedHookLoadPackage {
+    private static final String TAG = "NitzPriority";
+    private static final int ORIGIN_TELEPHONY = 1;
+    private static final int ORIGIN_NETWORK = 3;
+    private static final int ORIGIN_GNSS = 4;
+    static final int AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS = 100;
+    static final String THRESHOLD_STATUS_PROPERTY = "debug.nitz.clock_threshold";
+    static final String THRESHOLD_CONFIG_PROPERTY = "debug.nitz.clock_threshold_config";
+    static final int MIN_CLOCK_UPDATE_THRESHOLD_MILLIS = 1;
+    static final int MAX_CLOCK_UPDATE_THRESHOLD_MILLIS = 2_000;
+
+    private final NitzSampleMonitor sampleMonitor = new NitzSampleMonitor();
+    private final GnssTriggerBridge gnssTriggerBridge = new GnssTriggerBridge();
+    private boolean gnssRuntimeEnabled;
+    private volatile int originalClockUpdateThresholdMillis = -1;
+    private volatile String lastPublishedThresholdStatus = "";
+
+    @Override
+    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
+        // Android framework / system_server is loaded under package name "android".
+        if (!"android".equals(lpparam.packageName)) return;
+
+        // Install the resource override before SystemServer reads it to decide whether to start
+        // GnssTimeUpdateService. Do not manually construct or start the service.
+        gnssRuntimeEnabled = enableGnssResourceIfSupported(lpparam);
+        gnssTriggerBridge.install(lpparam);
+        hookOriginPriorities(lpparam);
+        hookSystemClockUpdateThreshold(lpparam);
+        hookThresholdDecisionPath(lpparam);
+        hookTelephonySamples(lpparam);
+        hookGnssSuggestions(lpparam);
+        XposedBridge.log(TAG + ": loaded in android process; gnssRuntimeEnabled="
+            + gnssRuntimeEnabled);
+    }
+
+    private boolean enableGnssResourceIfSupported(
+            final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            findClass("com.android.server.timedetector.GnssTimeUpdateService$Lifecycle", lpparam);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": GNSS service class unavailable; leaving GNSS disabled: " + t);
+            return false;
+        }
+
+        try {
+            Class<?> boolResources = findClass("com.android.internal.R$bool", lpparam);
+            Field resourceField = boolResources.getField("config_enableGnssTimeUpdateService");
+            final int targetResourceId = resourceField.getInt(null);
+            if (targetResourceId == 0) {
+                XposedBridge.log(TAG + ": GNSS enable resource ID is zero; leaving GNSS disabled");
+                return false;
+            }
+
+            Class<?> resourcesClass = findClass("android.content.res.Resources", lpparam);
+            Set<?> hooks = XposedBridge.hookAllMethods(resourcesClass, "getBoolean",
+                new XC_MethodHook() {
+                    private boolean logged;
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            if (param.args == null || param.args.length != 1
+                                    || !(param.args[0] instanceof Number)
+                                    || ((Number) param.args[0]).intValue() != targetResourceId) {
+                                return;
+                            }
+                            boolean original = Boolean.TRUE.equals(param.getResult());
+                            param.setResult(Boolean.TRUE);
+                            if (!logged) {
+                                logged = true;
+                                XposedBridge.log(TAG + ": overrode only "
+                                    + "config_enableGnssTimeUpdateService resource id=0x"
+                                    + Integer.toHexString(targetResourceId)
+                                    + " original=" + original + " -> true");
+                            }
+                        } catch (Throwable t) {
+                            // A resource hook failure must not escape into SystemServer.
+                            XposedBridge.log(TAG + ": GNSS resource override failed safely: " + t);
+                        }
+                    }
+                });
+            if (hooks == null || hooks.isEmpty()) {
+                XposedBridge.log(TAG + ": Resources.getBoolean hook unavailable; leaving GNSS disabled");
+                return false;
+            }
+            XposedBridge.log(TAG + ": GNSS service class present; exact resource hook count="
+                + hooks.size());
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": unable to arm GNSS resource override; leaving GNSS disabled: "
+                + t);
+            return false;
+        }
+    }
+
+    private void hookOriginPriorities(final XC_LoadPackage.LoadPackageParam lpparam) {
+        // Primary hook: affects the configuration as it is assembled.
+        try {
+            XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.ServiceConfigAccessorImpl", lpparam),
+                "getOriginPriorities",
+                new PriorityHook("ServiceConfigAccessorImpl.getOriginPriorities",
+                    gnssRuntimeEnabled)
+            );
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": primary priority hook failed: " + t);
+        }
+
+        // Fallback hook: affects callers reading the final ConfigurationInternal value.
+        try {
+            XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.ConfigurationInternal", lpparam),
+                "getAutoOriginPriorities",
+                new PriorityHook("ConfigurationInternal.getAutoOriginPriorities",
+                    gnssRuntimeEnabled)
+            );
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": fallback priority hook failed: " + t);
+        }
+    }
+
+    private void hookSystemClockUpdateThreshold(
+            final XC_LoadPackage.LoadPackageParam lpparam) {
+        publishThresholdStatus(lpparam, "unavailable");
+        try {
+            Set<?> hooks = XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.ConfigurationInternal", lpparam),
+                "getSystemClockUpdateThresholdMillis",
+                new XC_MethodHook() {
+                    private boolean logged;
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        Object result = param.getResult();
+                        if (!(result instanceof Number)) return;
+                        int original = ((Number) result).intValue();
+                        int configured = configuredClockUpdateThreshold(lpparam);
+                        param.setResult(configured);
+                        if (!logged) {
+                            logged = true;
+                            XposedBridge.log(TAG + ": automatic system-clock update threshold "
+                                + original + " -> " + configured + " ms");
+                        }
+                        markThresholdApplied(lpparam, original, configured);
+                    }
+                }
+            );
+            if (hooks == null || hooks.isEmpty()) {
+                XposedBridge.log(TAG + ": system-clock threshold hook unavailable");
+                return;
+            }
+            publishThresholdStatus(lpparam, "armed");
+            XposedBridge.log(TAG + ": system-clock threshold hook armed; default="
+                + AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS + " ms, configurable range="
+                + MIN_CLOCK_UPDATE_THRESHOLD_MILLIS + ".."
+                + MAX_CLOCK_UPDATE_THRESHOLD_MILLIS + " ms; hook count=" + hooks.size());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": system-clock threshold hook failed safely: " + t);
+        }
+    }
+
+    private void publishThresholdStatus(XC_LoadPackage.LoadPackageParam lpparam, String value) {
+        // The decision path can run often; only write the status property when it changes.
+        if (value.equals(lastPublishedThresholdStatus)) return;
+        lastPublishedThresholdStatus = value;
+        try {
+            Class<?> systemProperties = findClass("android.os.SystemProperties", lpparam);
+            Method set = systemProperties.getDeclaredMethod("set", String.class, String.class);
+            set.setAccessible(true);
+            set.invoke(null, THRESHOLD_STATUS_PROPERTY, value);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": could not publish threshold status: " + t);
+        }
+    }
+
+    private int configuredClockUpdateThreshold(XC_LoadPackage.LoadPackageParam lpparam) {
+        int value = AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS;
+        try {
+            Class<?> systemProperties = findClass("android.os.SystemProperties", lpparam);
+            Method getInt = systemProperties.getDeclaredMethod(
+                "getInt", String.class, int.class);
+            getInt.setAccessible(true);
+            value = (Integer) getInt.invoke(null, THRESHOLD_CONFIG_PROPERTY,
+                AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": unable to read threshold setting; using default: " + t);
+        }
+        return Math.max(MIN_CLOCK_UPDATE_THRESHOLD_MILLIS,
+            Math.min(MAX_CLOCK_UPDATE_THRESHOLD_MILLIS, value));
+    }
+
+    private void hookThresholdDecisionPath(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Set<?> hooks = XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.TimeDetectorStrategyImpl", lpparam),
+                "setSystemClockAndConfidenceUnderWakeLock",
+                new XC_MethodHook() {
+                    private boolean logged;
+
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            Field configField = param.thisObject.getClass()
+                                .getDeclaredField("mCurrentConfigurationInternal");
+                            configField.setAccessible(true);
+                            Object configuration = configField.get(param.thisObject);
+                            if (configuration == null) return;
+
+                            Field thresholdField = configuration.getClass()
+                                .getDeclaredField("mSystemClockUpdateThresholdMillis");
+                            thresholdField.setAccessible(true);
+                            int original = thresholdField.getInt(configuration);
+                            int configured = configuredClockUpdateThreshold(lpparam);
+                            if (original != configured) {
+                                thresholdField.setInt(configuration, configured);
+                            }
+                            int effective = thresholdField.getInt(configuration);
+                            if (effective == configured) {
+                                markThresholdApplied(lpparam, original, configured);
+                                if (!logged) {
+                                    logged = true;
+                                    XposedBridge.log(TAG + ": decision-path clock threshold field "
+                                        + original + " -> " + effective + " ms");
+                                }
+                            } else {
+                                XposedBridge.log(TAG + ": decision-path threshold verification failed; "
+                                    + "observed=" + effective);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": decision-path threshold adjustment failed safely: "
+                                + t);
+                        }
+                    }
+                }
+            );
+            if (hooks == null || hooks.isEmpty()) {
+                XposedBridge.log(TAG + ": decision-path threshold hook unavailable");
+                return;
+            }
+            XposedBridge.log(TAG + ": decision-path threshold hook count=" + hooks.size());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": decision-path threshold hook failed safely: " + t);
+        }
+    }
+
+    private void markThresholdApplied(XC_LoadPackage.LoadPackageParam lpparam, int original,
+            int configured) {
+        if (original != configured
+                && originalClockUpdateThresholdMillis < 0) {
+            originalClockUpdateThresholdMillis = original;
+        }
+        int sourceValue = originalClockUpdateThresholdMillis >= 0
+            ? originalClockUpdateThresholdMillis : original;
+        publishThresholdStatus(lpparam,
+            configured + ":" + sourceValue);
+    }
+
+    private void hookTelephonySamples(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Set<?> hooks = XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.TimeDetectorStrategyImpl", lpparam),
+                "suggestTelephonyTime",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (param.args == null || param.args.length == 0 || param.args[0] == null) {
+                            XposedBridge.log(TAG + ": sample monitor ignored empty telephony suggestion");
+                            return;
+                        }
+                        try {
+                            XposedBridge.log(TAG + ": NITZ sample "
+                                + sampleMonitor.observe(param.args[0]));
+                        } catch (Throwable t) {
+                            // Diagnostics must never interfere with system_server time detection.
+                            XposedBridge.log(TAG + ": sample monitor failed safely: " + t);
+                        }
+                    }
+                }
+            );
+            XposedBridge.log(TAG + ": telephony sample monitor hooks=" + hooks.size());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": telephony sample monitor hook unavailable: " + t);
+        }
+    }
+
+    private void hookGnssSuggestions(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Set<?> hooks = XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.TimeDetectorStrategyImpl", lpparam),
+                "suggestGnssTime",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Object suggestion = param.args != null && param.args.length > 0
+                            ? param.args[0] : null;
+                        XposedBridge.log(TAG + ": GNSS time suggestion reached time_detector: "
+                            + String.valueOf(suggestion));
+                    }
+                }
+            );
+            XposedBridge.log(TAG + ": GNSS suggestion monitor hooks=" + hooks.size());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": GNSS suggestion monitor hook unavailable: " + t);
+        }
+    }
+
+    private Class<?> findClass(String name, XC_LoadPackage.LoadPackageParam p)
+            throws ClassNotFoundException {
+        return Class.forName(name, false, p.classLoader);
+    }
+
+    private static int[] prioritized(int[] original, boolean gnssEnabled) {
+        if (original == null || original.length == 0) return original;
+        return gnssEnabled ? gnssThenTelephony(original) : telephonyFirst(original);
+    }
+
+    private static int[] gnssThenTelephony(int[] original) {
+        List<Integer> result = new ArrayList<>(original.length + 1);
+        boolean hasGnss = false;
+        for (int value : original) {
+            if (value == ORIGIN_GNSS) hasGnss = true;
+        }
+
+        // When the GNSS service is present and its enable resource is hooked, make GNSS the
+        // highest origin. Add it if the OEM resource array omitted it; Android will still fall
+        // back to the lower-priority origins when no valid GNSS suggestion exists.
+        if (!hasGnss) result.add(ORIGIN_GNSS);
+        for (int value : original) if (value == ORIGIN_GNSS) result.add(value);
+        for (int value : original) if (value == ORIGIN_TELEPHONY) result.add(value);
+        for (int value : original) if (value == ORIGIN_NETWORK) result.add(value);
+        for (int value : original) {
+            if (value != ORIGIN_GNSS && value != ORIGIN_TELEPHONY && value != ORIGIN_NETWORK) {
+                result.add(value);
+            }
+        }
+
+        int[] adjusted = toArray(result);
+        if (same(original, adjusted)) return original;
+        XposedBridge.log(TAG + ": GNSS-first origin priorities " + format(original)
+            + " -> " + format(adjusted));
+        return adjusted;
+    }
+
+    private static int[] telephonyFirst(int[] original) {
+        if (original == null || original.length < 2) return original;
+
+        int telephonyIndex = -1;
+        int networkIndex = -1;
+        for (int i = 0; i < original.length; i++) {
+            if (original[i] == ORIGIN_TELEPHONY && telephonyIndex < 0) telephonyIndex = i;
+            if (original[i] == ORIGIN_NETWORK && networkIndex < 0) networkIndex = i;
+        }
+        if (telephonyIndex < 0 || networkIndex < 0 || telephonyIndex < networkIndex) {
+            return original;
+        }
+
+        // Move only the first telephony entry immediately before network. This preserves every
+        // element, including duplicate origins, and keeps other entries' relative order.
+        int[] adjusted = original.clone();
+        System.arraycopy(adjusted, networkIndex, adjusted, networkIndex + 1,
+            telephonyIndex - networkIndex);
+        adjusted[networkIndex] = ORIGIN_TELEPHONY;
+        XposedBridge.log(TAG + ": telephony-first origin priorities " + format(original)
+            + " -> " + format(adjusted));
+        return adjusted;
+    }
+
+    private static int[] toArray(List<Integer> values) {
+        int[] result = new int[values.size()];
+        for (int i = 0; i < values.size(); i++) result[i] = values.get(i);
+        return result;
+    }
+
+    private static boolean same(int[] left, int[] right) {
+        if (left.length != right.length) return false;
+        for (int i = 0; i < left.length; i++) if (left[i] != right[i]) return false;
+        return true;
+    }
+
+    private static String format(int[] values) {
+        if (values == null) return "null";
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < values.length; i++) {
+            if (i > 0) out.append(',');
+            out.append(values[i]);
+        }
+        return out.append(']').toString();
+    }
+
+    private static final class PriorityHook extends XC_MethodHook {
+        private final String method;
+        private final boolean gnssEnabled;
+        private boolean unchangedLogged;
+
+        PriorityHook(String method, boolean gnssEnabled) {
+            this.method = method;
+            this.gnssEnabled = gnssEnabled;
+        }
+
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) {
+            Object value = param.getResult();
+            if (!(value instanceof int[])) return;
+            int[] original = (int[]) value;
+            int[] adjusted = prioritized(original, gnssEnabled);
+            if (adjusted != original) {
+                param.setResult(adjusted);
+            } else if (!unchangedLogged) {
+                unchangedLogged = true;
+                XposedBridge.log(TAG + ": " + method + " priorities unchanged " + format(original));
+            }
+        }
+    }
+}

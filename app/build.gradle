@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Signing credentials live in keystore.properties (git-ignored). When the file or
+// keystore is absent (e.g. CI without secrets), fall back to debug signing so the
+// build still produces an installable APK.
+def keystoreProps = new Properties()
+def keystorePropsFile = rootProject.file('keystore.properties')
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+def releaseKeystore = rootProject.file('release.keystore')
+
+android {
+    namespace 'com.example.nitzpriority'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.example.nitzpriority'
+        minSdk 26
+        targetSdk 35
+        versionCode 36
+        versionName '1.35'
+    }
+
+    signingConfigs {
+        release {
+            storeFile releaseKeystore
+            storePassword keystoreProps.getProperty('storePassword')
+            keyAlias keystoreProps.getProperty('keyAlias', 'nitzpriority')
+            keyPassword keystoreProps.getProperty('keyPassword')
+        }
+    }
+
+    buildTypes {
+        release {
+            // Minification must stay off: the Xposed entry class is loaded reflectively.
+            minifyEnabled false
+            signingConfig (releaseKeystore.exists() && keystoreProps.getProperty('storePassword')
+                ? signingConfigs.release : signingConfigs.debug)
+        }
+    }
+}
+
+dependencies {
+    compileOnly 'de.robv.android.xposed:api:82'
+}

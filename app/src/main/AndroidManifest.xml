@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_base_station_sync"
+        android:roundIcon="@mipmap/ic_base_station_sync"
+        android:theme="@style/AppTheme"
+        android:allowBackup="false"
+        android:supportsRtl="true">
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription"
+            android:value="GNSS 授时优先、NITZ 后备；LSPosed 作用域勾选系统框架(android)，诊断页顶部可调自动改时门槛 1–2000 ms。" />
+        <meta-data android:name="xposedminversion" android:value="93" />
+
+        <service
+            android:name=".GnssLocationTrackingService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+
+        <service
+            android:name=".FloatingClockService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="用户主动开启的全局悬浮时钟显示" />
+        </service>
+
+        <receiver
+            android:name=".FloatingEventAlarmReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".FloatingEventBootReceiver"
+            android:exported="true"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+        <activity
+            android:name=".GnssCalibrationActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".TimeDiagnosticsActivity"
+            android:exported="false"
+            android:label="授时诊断"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".FloatingClockSettingsActivity"
+            android:exported="false"
+            android:label="悬浮时间设置"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".FloatingEventActivity"
+            android:exported="false"
+            android:label="定时事件"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+</manifest>
