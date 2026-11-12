@@ -5,19 +5,26 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 /** User-enabled global overlay clock, kept alive by a visible foreground-service notification. */
@@ -30,7 +37,11 @@ public final class FloatingClockService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WindowManager windowManager;
-    private TextView clockView;
+    private LinearLayout clockContainer;
+    private TextView secondsView;
+    private TextView millisView;
+    private String lastSecondsText = "";
+    private String lastMillisText = "";
     private WindowManager.LayoutParams layoutParams;
     private int appliedTextSize = -1;
     private int appliedTextColor = 0;
@@ -42,11 +53,31 @@ public final class FloatingClockService extends Service {
     private int startY;
     private boolean moved;
     private int touchSlop;
+    private boolean screenOn = true;
+    private boolean snapPending;
+    private int snapTargetX;
+    private int snapTargetY;
+
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+                // The overlay is invisible with the screen off; stop waking the
+                // main thread every 50 ms until the screen comes back.
+                screenOn = false;
+                handler.removeCallbacks(ticker);
+            } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                screenOn = true;
+                handler.removeCallbacks(ticker);
+                handler.post(ticker);
+            }
+        }
+    };
 
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
-            if (clockView == null) return;
+            if (clockContainer == null || !screenOn) return;
             long elapsedNow = android.os.SystemClock.elapsedRealtime();
             boolean checkOverlayPermission =
                 elapsedNow - lastOverlayPermissionCheckElapsed >= 1_000L;
@@ -67,21 +98,65 @@ public final class FloatingClockService extends Service {
             long now = System.currentTimeMillis();
             applyAppearanceIfChanged();
             int digits = millisecondDigits();
-            clockView.setText(renderTime(now, digits));
+            updateClockText(now, digits);
             // Without millisecond digits there is nothing to show between seconds; wake up
             // slightly after the next second boundary instead of redrawing 20 times a second.
+            // In millis mode the delay is aligned to the 50 ms frame boundary so the
+            // tick does not drift fast/slow against the wall clock.
             long delay = digits == 0
                 ? 1_000L - (now % 1_000L) + 20L
-                : FRAME_MILLIS;
+                : FRAME_MILLIS - (now % FRAME_MILLIS);
             handler.postDelayed(this, delay);
         }
     };
+
+    /** Seconds and millis live in separate TextViews so the millis part can fade/slide on its own instead of replacing the whole string every frame. */
+    private void updateClockText(long now, int digits) {
+        String full = FloatingClockStyle.formatClock(now, digits);
+        String seconds = digits == 0 ? full : full.substring(0, full.length() - digits - 1);
+        String millis = digits == 0 ? "" : full.substring(full.length() - digits - 1);
+        if (!seconds.equals(lastSecondsText)) {
+            lastSecondsText = seconds;
+            secondsView.setText(seconds);
+        }
+        if (digits == 0) {
+            if (millisView.getVisibility() != View.GONE) millisView.setVisibility(View.GONE);
+            lastMillisText = "";
+            return;
+        }
+        if (millisView.getVisibility() != View.VISIBLE) millisView.setVisibility(View.VISIBLE);
+        if (!millis.equals(lastMillisText)) {
+            lastMillisText = millis;
+            millisView.setText(millis);
+            animateMillisChange();
+        }
+    }
+
+    /**
+     * Millis changes every frame, so this is a short soft fade/slide, not a discrete roll:
+     * the 90 ms animation restarts each tick and the digit reads as gently pulsing
+     * instead of hard-cutting. Skipped entirely when animations are off.
+     */
+    private void animateMillisChange() {
+        if (!FloatingClockStyle.animationsEnabled(this)) return;
+        millisView.animate().cancel();
+        millisView.setAlpha(0.5f);
+        millisView.setTranslationY(FloatingClockStyle.dp(this, 3));
+        millisView.animate().alpha(1f).translationY(0f).setDuration(90)
+            .setInterpolator(new DecelerateInterpolator()).start();
+    }
 
     @Override
     public void onCreate() {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        screenOn = powerManager == null || powerManager.isInteractive();
+        IntentFilter screenFilter = new IntentFilter();
+        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
+        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
+        registerReceiver(screenReceiver, screenFilter);
         createNotificationChannel();
     }
 
@@ -108,9 +183,9 @@ public final class FloatingClockService extends Service {
             } else {
                 startForeground(NOTIFICATION_ID, buildNotification());
             }
-            if (clockView == null) addOverlay();
+            if (clockContainer == null) addOverlay();
             applyAppearanceIfChanged();
-            clockView.setText(renderTime(System.currentTimeMillis(), millisecondDigits()));
+            updateClockText(System.currentTimeMillis(), millisecondDigits());
             FloatingClockStyle.preferences(this).edit()
                 .putBoolean(FloatingClockStyle.KEY_RUNNING, true)
                 .remove(FloatingClockStyle.KEY_LAST_ERROR)
@@ -132,10 +207,20 @@ public final class FloatingClockService extends Service {
     }
 
     private void addOverlay() {
-        clockView = new TextView(this);
-        clockView.setSingleLine(true);
-        clockView.setIncludeFontPadding(false);
-        clockView.setContentDescription("悬浮时间；轻点打开设置，拖动可移动位置");
+        clockContainer = new LinearLayout(this);
+        clockContainer.setOrientation(LinearLayout.HORIZONTAL);
+        clockContainer.setGravity(Gravity.CENTER_VERTICAL);
+        secondsView = new TextView(this);
+        secondsView.setSingleLine(true);
+        secondsView.setIncludeFontPadding(false);
+        millisView = new TextView(this);
+        millisView.setSingleLine(true);
+        millisView.setIncludeFontPadding(false);
+        clockContainer.addView(secondsView, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        clockContainer.addView(millisView, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        clockContainer.setContentDescription("悬浮时间；轻点打开设置，拖动可移动位置");
         applyAppearanceIfChanged();
 
         android.content.SharedPreferences prefs = FloatingClockStyle.preferences(this);
@@ -151,10 +236,20 @@ public final class FloatingClockService extends Service {
         layoutParams.gravity = Gravity.TOP | Gravity.LEFT;
         layoutParams.x = savedX < 0 ? FloatingClockStyle.dp(this, 14) : savedX;
         layoutParams.y = savedY < 0 ? FloatingClockStyle.dp(this, 130) : savedY;
-        windowManager.addView(clockView, layoutParams);
+        windowManager.addView(clockContainer, layoutParams);
         // Saved coordinates may be off-screen after rotation or a display change.
         clampPosition(false);
-        clockView.setOnTouchListener(this::handleOverlayTouch);
+        clockContainer.setOnTouchListener(this::handleOverlayTouch);
+    }
+
+    private int[] displaySize() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            android.graphics.Rect bounds = windowManager.getCurrentWindowMetrics().getBounds();
+            return new int[] {bounds.width(), bounds.height()};
+        }
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+        windowManager.getDefaultDisplay().getRealMetrics(metrics);
+        return new int[] {metrics.widthPixels, metrics.heightPixels};
     }
 
     /**
@@ -164,21 +259,10 @@ public final class FloatingClockService extends Service {
      * the finger even while already in bounds.
      */
     private void clampPosition(boolean forceUpdate) {
-        if (layoutParams == null || windowManager == null || clockView == null) return;
-        int screenWidth;
-        int screenHeight;
-        if (Build.VERSION.SDK_INT >= 30) {
-            android.graphics.Rect bounds = windowManager.getCurrentWindowMetrics().getBounds();
-            screenWidth = bounds.width();
-            screenHeight = bounds.height();
-        } else {
-            android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
-            windowManager.getDefaultDisplay().getRealMetrics(metrics);
-            screenWidth = metrics.widthPixels;
-            screenHeight = metrics.heightPixels;
-        }
-        int maxX = Math.max(0, screenWidth - FloatingClockStyle.dp(this, 40));
-        int maxY = Math.max(0, screenHeight - FloatingClockStyle.dp(this, 40));
+        if (layoutParams == null || windowManager == null || clockContainer == null) return;
+        int[] size = displaySize();
+        int maxX = Math.max(0, size[0] - FloatingClockStyle.dp(this, 40));
+        int maxY = Math.max(0, size[1] - FloatingClockStyle.dp(this, 40));
         int clampedX = Math.max(0, Math.min(layoutParams.x, maxX));
         int clampedY = Math.max(0, Math.min(layoutParams.y, maxY));
         boolean changed = clampedX != layoutParams.x || clampedY != layoutParams.y;
@@ -186,7 +270,7 @@ public final class FloatingClockService extends Service {
         layoutParams.y = clampedY;
         if (!changed && !forceUpdate) return;
         try {
-            windowManager.updateViewLayout(clockView, layoutParams);
+            windowManager.updateViewLayout(clockContainer, layoutParams);
         } catch (RuntimeException ignored) {
             // The system may remove an overlay while permissions are being changed.
         }
@@ -196,11 +280,15 @@ public final class FloatingClockService extends Service {
         if (layoutParams == null || windowManager == null) return false;
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                // A snap animation may still be running: finish it instantly so the
+                // drag starts from the real position, not from a mid-animation offset.
+                finishPendingSnap();
                 downRawX = event.getRawX();
                 downRawY = event.getRawY();
                 startX = layoutParams.x;
                 startY = layoutParams.y;
                 moved = false;
+                pressFeedback(true);
                 return true;
             case MotionEvent.ACTION_MOVE:
                 int dx = Math.round(event.getRawX() - downRawX);
@@ -213,11 +301,9 @@ public final class FloatingClockService extends Service {
                 }
                 return true;
             case MotionEvent.ACTION_UP:
+                pressFeedback(false);
                 if (moved) {
-                    FloatingClockStyle.preferences(this).edit()
-                        .putInt(FloatingClockStyle.KEY_X, layoutParams.x)
-                        .putInt(FloatingClockStyle.KEY_Y, layoutParams.y)
-                        .apply();
+                    snapToEdge();
                 } else {
                     Intent settings = new Intent(this, FloatingClockSettingsActivity.class)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -225,20 +311,101 @@ public final class FloatingClockService extends Service {
                 }
                 return true;
             case MotionEvent.ACTION_CANCEL:
+                pressFeedback(false);
+                if (moved) snapToEdge();
                 return true;
             default:
                 return false;
         }
     }
 
+    /** Press: 1.05x + deeper shadow, 100 ms. Released: back to 1.0. Skipped when animations are off. */
+    private void pressFeedback(boolean pressed) {
+        if (clockContainer == null) return;
+        if (!FloatingClockStyle.animationsEnabled(this)) {
+            clockContainer.setScaleX(1f);
+            clockContainer.setScaleY(1f);
+            clockContainer.setElevation(FloatingClockStyle.dp(this, 8));
+            return;
+        }
+        clockContainer.animate().cancel();
+        clockContainer.animate().scaleX(pressed ? 1.05f : 1f).scaleY(pressed ? 1.05f : 1f)
+            .setDuration(100).start();
+        clockContainer.setElevation(FloatingClockStyle.dp(this, pressed ? 14 : 8));
+    }
+
+    /**
+     * Snap to the nearest left/right edge (14 dp margin) over 200 ms. Only the container's
+     * translation is animated (GPU compositing, no IPC); the real layout params are
+     * written once at the end.
+     */
+    private void snapToEdge() {
+        if (clockContainer == null || layoutParams == null) return;
+        int[] size = displaySize();
+        int margin = FloatingClockStyle.dp(this, 14);
+        int width = clockContainer.getWidth();
+        int targetX = layoutParams.x + width / 2 < size[0] / 2
+            ? margin : Math.max(margin, size[0] - width - margin);
+        int maxY = Math.max(0, size[1] - FloatingClockStyle.dp(this, 40));
+        int targetY = Math.max(0, Math.min(layoutParams.y, maxY));
+        int dx = targetX - layoutParams.x;
+        int dy = targetY - layoutParams.y;
+        if (dx == 0 && dy == 0) {
+            saveOverlayPosition();
+            return;
+        }
+        if (!FloatingClockStyle.animationsEnabled(this)) {
+            layoutParams.x = targetX;
+            layoutParams.y = targetY;
+            clampPosition(true);
+            saveOverlayPosition();
+            return;
+        }
+        snapPending = true;
+        snapTargetX = targetX;
+        snapTargetY = targetY;
+        // Do NOT cancel the animator here: the press-release scale animation may
+        // still be running, and cancelling it would freeze the scale mid-flight.
+        // Adding translation to the same animator keeps the scale gliding to 1.0.
+        clockContainer.setTranslationX(0f);
+        clockContainer.setTranslationY(0f);
+        clockContainer.animate().translationX(dx).translationY(dy).setDuration(200)
+            .setInterpolator(new DecelerateInterpolator())
+            .withEndAction(this::finishPendingSnap).start();
+    }
+
+    private void finishPendingSnap() {
+        if (!snapPending || clockContainer == null) return;
+        snapPending = false;
+        clockContainer.animate().cancel();
+        clockContainer.setTranslationX(0f);
+        clockContainer.setTranslationY(0f);
+        // The cancel above can freeze a concurrent scale animation mid-flight.
+        clockContainer.setScaleX(1f);
+        clockContainer.setScaleY(1f);
+        layoutParams.x = snapTargetX;
+        layoutParams.y = snapTargetY;
+        clampPosition(true);
+        saveOverlayPosition();
+    }
+
+    private void saveOverlayPosition() {
+        FloatingClockStyle.preferences(this).edit()
+            .putInt(FloatingClockStyle.KEY_X, layoutParams.x)
+            .putInt(FloatingClockStyle.KEY_Y, layoutParams.y)
+            .apply();
+    }
+
     private void applyAppearanceIfChanged() {
-        if (clockView == null) return;
+        if (clockContainer == null) return;
         int size = FloatingClockStyle.textSize(this);
         int color = FloatingClockStyle.textColor(this);
         int transparency = FloatingClockStyle.backgroundTransparency(this);
         if (size == appliedTextSize && color == appliedTextColor
                 && transparency == appliedTransparency) return;
-        FloatingClockStyle.apply(this, clockView);
+        FloatingClockStyle.applyBackground(this, clockContainer);
+        FloatingClockStyle.applyText(this, secondsView);
+        FloatingClockStyle.applyText(this, millisView);
         appliedTextSize = size;
         appliedTextColor = color;
         appliedTransparency = transparency;
@@ -248,10 +415,6 @@ public final class FloatingClockService extends Service {
         int digits = FloatingClockStyle.preferences(this)
             .getInt("millisecond_digits", 3);
         return Math.max(0, Math.min(3, digits));
-    }
-
-    private String renderTime(long nowMillis, int digits) {
-        return FloatingClockStyle.formatClock(nowMillis, digits);
     }
 
     private Notification buildNotification() {
@@ -285,13 +448,20 @@ public final class FloatingClockService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(ticker);
-        if (clockView != null && windowManager != null) {
+        try {
+            unregisterReceiver(screenReceiver);
+        } catch (RuntimeException ignored) {
+            // Already unregistered, or registration never completed.
+        }
+        if (clockContainer != null && windowManager != null) {
             try {
-                windowManager.removeView(clockView);
+                windowManager.removeView(clockContainer);
             } catch (RuntimeException ignored) {
                 // It may already have been removed by the system.
             }
-            clockView = null;
+            clockContainer = null;
+            secondsView = null;
+            millisView = null;
         }
         FloatingClockStyle.preferences(this).edit()
             .putBoolean(FloatingClockStyle.KEY_RUNNING, false).apply();

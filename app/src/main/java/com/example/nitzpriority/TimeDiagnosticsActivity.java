@@ -19,9 +19,11 @@ import android.text.style.ForegroundColorSpan;
 import android.view.View;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -129,6 +131,9 @@ public final class TimeDiagnosticsActivity extends Activity {
     private final ExecutorService forceWorker = Executors.newSingleThreadExecutor();
     private WebView webView;
     private Button refreshButton;
+    private ProgressBar refreshProgress;
+    private String lastShownHtml;
+    private int pendingScrollY = -1;
     private Button forceButton;
     private Button clearHistoryButton;
     private Button applyThresholdButton;
@@ -171,6 +176,17 @@ public final class TimeDiagnosticsActivity extends Activity {
         calibrateParams.leftMargin = dp(8);
         actions.addView(calibrateButton, calibrateParams);
         root.addView(actions, new LinearLayout.LayoutParams(-1, -2));
+
+        // Thin indeterminate bar shown while a refresh is running; the old page
+        // stays visible underneath instead of flashing white.
+        refreshProgress = new ProgressBar(this, null,
+            android.R.attr.progressBarStyleHorizontal);
+        refreshProgress.setIndeterminate(true);
+        refreshProgress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams progressParams =
+            new LinearLayout.LayoutParams(-1, dp(3));
+        progressParams.setMargins(dp(12), 0, dp(12), 0);
+        root.addView(refreshProgress, progressParams);
 
         forceButton = new Button(this);
         forceButton.setText("强制跳改（可选授时源）");
@@ -237,6 +253,18 @@ public final class TimeDiagnosticsActivity extends Activity {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(false);
         settings.setDomStorageEnabled(false);
+        // No JS is involved: this only restores the scroll position saved before a
+        // periodic reload, so the page does not jump back to the top every 60 s.
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (pendingScrollY >= 0) {
+                    int y = pendingScrollY;
+                    pendingScrollY = -1;
+                    view.scrollTo(0, y);
+                }
+            }
+        });
         root.addView(webView, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(root);
         installSafeAreaInsets(root);
@@ -435,6 +463,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         if (refreshInProgress || worker.isShutdown()) return;
         refreshInProgress = true;
         refreshButton.setEnabled(false);
+        setRefreshing(true);
         forceButton.setEnabled(false);
         final android.content.SharedPreferences prefs = getSharedPreferences(
             "calibration_status", MODE_PRIVATE);
@@ -497,6 +526,7 @@ public final class TimeDiagnosticsActivity extends Activity {
                 nitzCalibrationStatus, trendPoints, ntscResult);
             runOnUiThread(() -> {
                 refreshInProgress = false;
+                setRefreshing(false);
                 refreshButton.setEnabled(true);
                 forceButton.setEnabled(currentDiagnosticsHasRoot && currentForceOptions.length > 0);
                 applyThresholdButton.setEnabled(currentDiagnosticsHasRoot);
@@ -508,6 +538,13 @@ public final class TimeDiagnosticsActivity extends Activity {
                 showHtml(html);
             });
         });
+    }
+
+    /** Thin indeterminate bar under the action row while a refresh is running. */
+    private void setRefreshing(boolean refreshing) {
+        if (refreshProgress != null) {
+            refreshProgress.setVisibility(refreshing ? View.VISIBLE : View.GONE);
+        }
     }
 
     private String buildHtml(boolean hasRoot, String identity, String timeDump, String gnssDump,
@@ -533,7 +570,14 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append(".state:before{content:'';width:8px;height:8px;border-radius:50%;background:currentColor;display:inline-block}")
             .append(".source{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}")
             .append(".name{font-size:16px;font-weight:750;color:#193b59}.meta{font-size:12px;color:#71869b;margin-top:5px;line-height:1.5}")
-            .append(".sync-title{font-size:18px;font-weight:800}.sync-detail{font-size:13px;line-height:1.6;color:#536d83;margin-top:8px}")
+            .append(".sync-title{font-size:18px;font-weight:800;display:flex;align-items:center;gap:8px}.sync-detail{font-size:13px;line-height:1.6;color:#536d83;margin-top:8px}")
+            .append(".sync-title:before{content:'';width:10px;height:10px;border-radius:50%;background:currentColor;flex:none}")
+            .append("@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(1.35)}}")
+            .append("@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}")
+            .append(".sync-title.sync-good:before{animation:pulse 1.6s ease-in-out infinite}")
+            .append(".sync-title.sync-warn:before{animation:blink 1.2s ease-in-out infinite}")
+            .append(".card{transition:background-color .4s}.sync-title{transition:color .4s}.value{transition:color .4s}")
+            .append("@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}")
             .append(".sync-good{color:#13774d}.sync-warn{color:#a15c00}.sync-unknown{color:#536c83}.sync-title.lead{color:#198754}.sync-title.lag{color:#c62828}.sync-title.equal{color:#536176}")
             .append(".value{font-size:27px;font-weight:800;letter-spacing:-.6px;white-space:nowrap;color:#1769d2}")
             .append(".value.lead{color:#198754}.value.lag{color:#c62828}.value.equal{color:#536176}")
@@ -2061,7 +2105,13 @@ public final class TimeDiagnosticsActivity extends Activity {
     }
 
     private void showHtml(String html) {
-        if (webView != null) webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
+        if (webView == null) return;
+        // Skip the reload entirely when nothing changed: a full loadDataWithBaseURL
+        // every 60 s white-flashes and drops the scroll position for identical content.
+        if (html.equals(lastShownHtml)) return;
+        lastShownHtml = html;
+        pendingScrollY = webView.getScrollY();
+        webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
     }
 
     private int dp(int value) {

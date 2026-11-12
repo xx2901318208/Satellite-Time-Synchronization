@@ -3,7 +3,10 @@ package com.example.nitzpriority;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.provider.Settings;
+import android.view.View;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
@@ -56,11 +59,24 @@ final class FloatingClockStyle {
     }
 
     static void apply(Context context, TextView view) {
+        applyText(context, view);
+        applyBackground(context, view);
+    }
+
+    /** Text size / color / typeface only; the overlay splits seconds and millis into two views. */
+    static void applyText(Context context, TextView view) {
+        view.setTextSize(textSize(context));
+        view.setTextColor(textColor(context));
+        // Monospace digits: in a proportional font '1' is narrower than '8', so the
+        // whole string wobbles left-right every frame as the millis digits change.
+        view.setTypeface(Typeface.MONOSPACE);
+        view.setGravity(android.view.Gravity.CENTER);
+    }
+
+    /** Background, padding and elevation only; shared by the settings preview TextView and the overlay container. */
+    static void applyBackground(Context context, View view) {
         int color = textColor(context);
         int transparency = backgroundTransparency(context);
-        view.setTextSize(textSize(context));
-        view.setTextColor(color);
-        view.setGravity(android.view.Gravity.CENTER);
         int padding = dp(context, 13);
         view.setPadding(padding, dp(context, 8), padding, dp(context, 8));
 
@@ -74,6 +90,20 @@ final class FloatingClockStyle {
             isDark(color) ? 120 : 230, isDark(color) ? 155 : 245, isDark(color) ? 185 : 255));
         view.setBackground(background);
         view.setElevation(dp(context, 8));
+    }
+
+    /**
+     * False when the user turned animations off system-wide (ANIMATOR_DURATION_SCALE = 0).
+     * Every native animation in this module must check this and jump straight to the
+     * end state; WebView CSS animations are gated by the prefers-reduced-motion query.
+     */
+    static boolean animationsEnabled(Context context) {
+        try {
+            return Settings.Global.getFloat(context.getContentResolver(),
+                Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f;
+        } catch (RuntimeException ignored) {
+            return true;
+        }
     }
 
     static String formatTime(long timeMillis) {
