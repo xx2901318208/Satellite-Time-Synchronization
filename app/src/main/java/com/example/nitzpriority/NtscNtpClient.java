@@ -42,12 +42,12 @@ final class NtscNtpClient {
         "ntp.ntsc.ac.cn",
     };
     /**
-     * NTSC official IP (published alongside ntp.ntsc.ac.cn). Used only when
-     * at least one NTSC domain failed DNS: with DNS broken, resolving any
-     * name is hopeless, but a literal IP needs no DNS at all. Never tried
-     * when every name resolved but the server simply did not answer — the IP
-     * is the same server and would time out the same way, so the remaining
-     * budget is kept for the pool fallback instead.
+     * NTSC official IP (published alongside ntp.ntsc.ac.cn). Used when the
+     * domain failed DNS, or resolved but never answered: DNS may return a
+     * different address than this one (observed on device 2026-11-12: DNS
+     * gives 113.141.164.38), and that address may not serve NTP. Never tried
+     * when under 4 s of the deadline remain, so the pool fallback still gets
+     * its chance.
      */
     static final String NTSC_DIRECT_IP = "210.72.145.44";
     /** Fallback when every NTSC host is unreachable. Not an NTSC source. */
@@ -171,21 +171,28 @@ final class NtscNtpClient {
     }
 
     /**
-     * Tries, in order: the NTSC domains, the NTSC direct IP (only when at
-     * least one domain failed DNS), then the pool fallback. A per-host
-     * failure never aborts the query: DNS failure, timeout, and too-few-samples
-     * are recorded per host and the next host is tried. Only when every name
-     * failed DNS does the result say so; a timeout is never reported as a
-     * DNS failure.
+     * Tries, in order: the NTSC domain, the NTSC direct IP (when the domain
+     * failed DNS, or resolved but never answered), then the pool fallback.
+     * The IP is worth trying even when the name resolved: DNS may return a
+     * different address than the official one (observed on device 2026-11-12:
+     * ntp.ntsc.ac.cn resolves to 113.141.164.38, official IP 210.72.145.44),
+     * and the DNS address may not serve NTP while the official IP does. The
+     * IP attempt is skipped when under 4 s of the deadline remain, so the
+     * pool fallback still gets a chance. A per-host failure never aborts the
+     * query: DNS failure, timeout, and too-few-samples are recorded per host
+     * and the next host is tried. Only when every name failed DNS does the
+     * result say so; a timeout is never reported as a DNS failure.
      */
     private static Result queryFresh() {
         long deadlineElapsed = SystemClock.elapsedRealtime() + QUERY_DEADLINE_MILLIS;
         String lastError = "未知错误";
         int dnsFailures = 0;
+        boolean ntpUnanswered = false;
         for (String host : NTSC_HOSTS) {
             try {
                 Result result = queryServer(host, false, false, deadlineElapsed);
                 if (result != null) return result;
+                ntpUnanswered = true;
                 lastError = "服务器 " + host + " 有效样本不足 3 个";
             } catch (UnknownHostException e) {
                 // One dead name must not kill the whole query: ntp1.ntsc.ac.cn
@@ -194,6 +201,7 @@ final class NtscNtpClient {
                 dnsFailures++;
                 lastError = "服务器 " + host + " DNS 解析失败";
             } catch (SocketTimeoutException e) {
+                ntpUnanswered = true;
                 lastError = "服务器 " + host + " 超时无响应";
             } catch (Exception e) {
                 lastError = "服务器 " + host + " 查询失败：" + e.getMessage();
@@ -204,11 +212,12 @@ final class NtscNtpClient {
             }
         }
         // Direct-IP fallback. A literal IP needs no DNS, so it is the one
-        // thing that can still work when name resolution is broken. It is
-        // only attempted when DNS actually failed somewhere above: when every
-        // name resolved but the server never answered, the IP is the same
-        // server and would time out the same way.
-        if (dnsFailures > 0 && SystemClock.elapsedRealtime() < deadlineElapsed) {
+        // thing that can still work when name resolution is broken — and also
+        // when resolution works but points at an address that does not serve
+        // NTP. Only skipped when under 4 s of the deadline remain, so the
+        // pool fallback still gets its chance.
+        long remainingMillis = deadlineElapsed - SystemClock.elapsedRealtime();
+        if ((dnsFailures > 0 || ntpUnanswered) && remainingMillis >= 4000) {
             try {
                 Result result = queryServer(NTSC_DIRECT_IP, false, true, deadlineElapsed);
                 if (result != null) return result;

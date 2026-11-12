@@ -1355,7 +1355,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             html.append("（授时中心全部无响应，已回落到 cn.pool.ntp.org，非授时中心直连）");
         }
         if (result.directIp) {
-            html.append("（授时中心 IP 直连，域名解析失败时使用）");
+            html.append("（授时中心 IP 直连）");
         }
         html.append("；参考时刻：")
             .append(escape(formatReferenceTime(
