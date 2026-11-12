@@ -736,7 +736,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             String ntpSwitch = ntpStatusParts.length > 0
                 ? ntpStatusParts[0].trim() : "";
             String[] ntpServerParts = ntpStatusParts.length > 1
-                ? ntpServerParts[1].split(Pattern.quote(NTP_SERVER_MARKER), 2)
+                ? ntpStatusParts[1].split(Pattern.quote(NTP_SERVER_MARKER), 2)
                 : new String[0];
             String ntpStatus = ntpServerParts.length > 0
                 ? ntpServerParts[0].trim() : "";
