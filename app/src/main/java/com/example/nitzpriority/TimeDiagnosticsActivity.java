@@ -861,7 +861,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             html.append("（授时中心全部无响应，已回落到 cn.pool.ntp.org，非授时中心直连）");
         }
         html.append("；参考时刻：")
-            .append(escape(formatBeijingTime(
+            .append(escape(formatReferenceTime(
                 System.currentTimeMillis() + result.offsetMillis)))
             .append("；往返延迟中位 ").append(result.medianRttMillis)
             .append(" 毫秒；采样 ").append(result.samplesAttempted)
