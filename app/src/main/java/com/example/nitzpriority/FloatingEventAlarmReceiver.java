@@ -323,7 +323,8 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
         ids.addAll(persistedActiveAlerts(context));
         writePersistedActiveAlerts(context, new HashSet<>());
         ids.add(TEST_NOTIFICATION_ID + 1);
-        for (FloatingEventStore.Event event : FloatingEventStore.load(context)) {
+        // loadOrEmpty: both copies unreadable must not crash stop-all-alerts.
+        for (FloatingEventStore.Event event : FloatingEventStore.loadOrEmpty(context)) {
             ids.add((event.id + "due").hashCode());
             ids.add((event.id + "reminder").hashCode());
         }

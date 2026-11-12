@@ -20,12 +20,23 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 
 import java.util.Locale;
 
 /** User-started, time-limited foreground GPS tracking during GNSS calibration. */
 public final class GnssLocationTrackingService extends Service {
     static final String ACTION_START = "com.example.nitzpriority.action.START_GNSS_TRACKING";
+    /**
+     * Periodic-sync burst, started by FloatingClockService every 5 minutes
+     * (15 on low battery). Runs the same GPS tracking, but stops after the
+     * first validated raw GnssClock offset or a 60 s timeout, and never
+     * touches the manual-calibration state in SharedPreferences.
+     */
+    static final String ACTION_PERIODIC_GNSS_BURST =
+        "com.example.nitzpriority.action.PERIODIC_GNSS_BURST";
+    private static final String TAG = "NitzPriority";
+    private static final long BURST_TIMEOUT_MILLIS = 60_000L;
     private static final String ACTION_STOP_BY_USER =
         "com.example.nitzpriority.action.STOP_GNSS_TRACKING_BY_USER";
     private static final String EXTRA_TOKEN = "session_token";
@@ -45,6 +56,8 @@ public final class GnssLocationTrackingService extends Service {
     private int rawMeasurementCount;
     private int lastDiscontinuityCount = -1;
     private boolean tracking;
+    /** True while serving a periodic-sync burst (see ACTION_PERIODIC_GNSS_BURST). */
+    private boolean burstMode;
     private final Runnable timeoutRunnable = () -> stopTracking("TIMED_OUT");
 
     @Override
@@ -66,6 +79,14 @@ public final class GnssLocationTrackingService extends Service {
             if (sessionToken == null) sessionToken = "";
             startTracking();
         }
+        if (ACTION_PERIODIC_GNSS_BURST.equals(action) && !tracking) {
+            // A burst never pre-empts a manual calibration session: if one
+            // is already tracking, its raw measurements already feed the
+            // drift store through the same callback path.
+            burstMode = true;
+            sessionToken = "";
+            startTracking();
+        }
         return START_NOT_STICKY;
     }
 
@@ -84,7 +105,9 @@ public final class GnssLocationTrackingService extends Service {
         }
 
         try {
-            Notification notification = buildNotification("正在启动 GPS 连续定位……");
+            Notification notification = buildNotification(burstMode
+                ? "定期同步：正在获取 GNSS 样本（最多 1 分钟）"
+                : "正在启动 GPS 连续定位……");
             if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(NOTIFICATION_ID, notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
@@ -95,16 +118,22 @@ public final class GnssLocationTrackingService extends Service {
             tracking = true;
             fixCount = 0;
             rawMeasurementCount = 0;
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .clear()
-                .putString("token", sessionToken)
-                .putString("state", "RUNNING")
-                .putString("detail", "正在持续请求 GPS 位置")
-                .apply();
+            if (!burstMode) {
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .clear()
+                    .putString("token", sessionToken)
+                    .putString("state", "RUNNING")
+                    .putString("detail", "正在持续请求 GPS 位置")
+                    .apply();
+            }
             locationListener = new LocationListener() {
                 @Override
                 public void onLocationChanged(Location location) {
                     if (location == null || !tracking) return;
+                    // A burst needs only the raw GnssClock measurements; the
+                    // per-fix state writes belong to manual calibration and
+                    // must not leave a stale RUNNING state behind.
+                    if (burstMode) return;
                     fixCount++;
                     long sampleElapsed = location.getElapsedRealtimeNanos() / 1_000_000L;
                     long receiptElapsed = SystemClock.elapsedRealtime();
@@ -146,8 +175,11 @@ public final class GnssLocationTrackingService extends Service {
             registerRawMeasurementsCallback();
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,
                 REQUEST_INTERVAL_MILLIS, 0f, locationListener, handler.getLooper());
-            handler.postDelayed(timeoutRunnable, MAX_TRACKING_MILLIS);
-            updateNotification("正在持续请求 GPS 位置并等待新的 GNSS 授时；最多 5 分钟");
+            handler.postDelayed(timeoutRunnable,
+                burstMode ? BURST_TIMEOUT_MILLIS : MAX_TRACKING_MILLIS);
+            updateNotification(burstMode
+                ? "定期同步：正在获取 GNSS 样本；最多 1 分钟"
+                : "正在持续请求 GPS 位置并等待新的 GNSS 授时；最多 5 分钟");
         } catch (SecurityException e) {
             writeState("ERROR", "启动 GPS 定位服务被拒绝：" + e.getMessage());
             stopTracking("ERROR");
@@ -161,6 +193,7 @@ public final class GnssLocationTrackingService extends Service {
         gnssStatusCallback = new GnssStatus.Callback() {
             @Override
             public void onStarted() {
+                if (burstMode) return;
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putString("token", sessionToken)
                     .putBoolean("gnss_receiver_started", true)
@@ -171,6 +204,7 @@ public final class GnssLocationTrackingService extends Service {
 
             @Override
             public void onStopped() {
+                if (burstMode) return;
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putString("token", sessionToken)
                     .putBoolean("gnss_receiver_started", false)
@@ -180,6 +214,7 @@ public final class GnssLocationTrackingService extends Service {
 
             @Override
             public void onFirstFix(int ttffMillis) {
+                if (burstMode) return;
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putString("token", sessionToken)
                     .putInt("time_to_first_fix_ms", ttffMillis)
@@ -189,7 +224,7 @@ public final class GnssLocationTrackingService extends Service {
 
             @Override
             public void onSatelliteStatusChanged(GnssStatus status) {
-                if (!tracking || status == null) return;
+                if (!tracking || status == null || burstMode) return;
                 int total = status.getSatelliteCount();
                 int usedTotal = 0;
                 int[] visible = new int[8];
@@ -377,6 +412,23 @@ public final class GnssLocationTrackingService extends Service {
                     clock.hasDriftNanosPerSecond()
                         ? Double.toString(clock.getDriftNanosPerSecond()) : "");
                 editor.apply();
+                if (burstMode && utcAvailable && !sampleDiscarded) {
+                    // First validated raw GnssClock offset of this burst: the
+                    // callback already checked freshness (1 s), leap second,
+                    // discontinuity and time uncertainty (< 100 ms), so this
+                    // is a trustworthy GNSS offset sample. Record it into the
+                    // shared drift store (the estimator's 55 s throttle keeps
+                    // bursts from flooding it) and stop the burst.
+                    long sampleElapsedMillis = clockElapsedNanos / 1_000_000L;
+                    long gnssOffsetMillis = Math.round(offsetMillis);
+                    ClockDriftEstimator.recordSample(
+                        getSharedPreferences(ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE),
+                        sampleElapsedMillis, gnssOffsetMillis, 100L,
+                        ClockDriftEstimator.SOURCE_GNSS);
+                    Log.i(TAG, "periodic sync: source=gnss offset=" + gnssOffsetMillis
+                        + "ms uncertainty=100ms");
+                    stopTracking("BURST_DONE");
+                }
             }
         };
         try {
@@ -430,8 +482,12 @@ public final class GnssLocationTrackingService extends Service {
         gnssMeasurementsCallback = null;
         boolean wasTracking = tracking;
         tracking = false;
-        if (wasTracking || "STOPPED_BY_USER".equals(finalState)
-                || "TIMED_OUT".equals(finalState) || "ERROR".equals(finalState)) {
+        // burstMode is cleared only after the block below: writeState() uses
+        // it to decide whether this stop may touch the manual-calibration
+        // state, and a burst stop (wasTracking == true) must not.
+        if ((wasTracking || "STOPPED_BY_USER".equals(finalState)
+                || "TIMED_OUT".equals(finalState) || "ERROR".equals(finalState))
+                && !burstMode) {
             String detail;
             if ("STOPPED_BY_USER".equals(finalState)) detail = "用户从通知停止了持续定位";
             else if ("TIMED_OUT".equals(finalState)) detail = "持续定位达到 5 分钟上限，已自动停止";
@@ -439,6 +495,7 @@ public final class GnssLocationTrackingService extends Service {
             else detail = "本次 GNSS 校准流程已结束，持续定位已停止";
             writeState(finalState, detail);
         }
+        burstMode = false;
         if (Build.VERSION.SDK_INT >= 24) {
             stopForeground(STOP_FOREGROUND_REMOVE);
         } else {
@@ -448,6 +505,13 @@ public final class GnssLocationTrackingService extends Service {
     }
 
     private void writeState(String state, String detail) {
+        if (burstMode) {
+            // A periodic burst must not overwrite the manual-calibration
+            // state the calibration page reads; its outcome is only a log
+            // line and a drift sample.
+            Log.i(TAG, "periodic gnss burst: " + state + " " + detail);
+            return;
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString("token", sessionToken)
             .putString("state", state)
@@ -522,6 +586,7 @@ public final class GnssLocationTrackingService extends Service {
             }
             tracking = false;
             writeState("STOPPED", "持续定位服务已结束");
+            burstMode = false;
         }
         super.onDestroy();
     }

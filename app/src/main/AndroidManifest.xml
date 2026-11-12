@@ -21,7 +21,7 @@
         android:supportsRtl="true">
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription"
-            android:value="GNSS 授时优先、NITZ 后备；LSPosed 作用域勾选系统框架(android)，诊断页顶部可调自动改时门槛 1–2000 ms。" />
+            android:value="GNSS 授时优先、NITZ 后备；LSPosed 作用域勾选系统框架(android)，诊断页顶部可调自动改时门槛 100–2000 ms（分来源：GNSS 10ms、网络 50ms、基站 2000ms）。" />
         <meta-data android:name="xposedminversion" android:value="93" />
 
         <service

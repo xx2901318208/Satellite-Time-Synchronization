@@ -11,12 +11,15 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.graphics.PixelFormat;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -27,13 +30,25 @@ import android.view.animation.DecelerateInterpolator;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /** User-enabled global overlay clock, kept alive by a visible foreground-service notification. */
 public final class FloatingClockService extends Service {
+    private static final String TAG = "NitzPriority";
     public static final String ACTION_START = "com.example.nitzpriority.action.START_FLOATING_CLOCK";
     private static final String ACTION_STOP = "com.example.nitzpriority.action.STOP_FLOATING_CLOCK";
     private static final String CHANNEL_ID = "floating_clock_service";
     private static final int NOTIFICATION_ID = 8140;
     private static final long FRAME_MILLIS = 50L;
+    /** Periodic sync: NTSC NTP + one GNSS burst, screen-on only. */
+    private static final long PERIODIC_SYNC_INTERVAL_MILLIS = 5L * 60 * 1000;
+    private static final long LOW_BATTERY_SYNC_INTERVAL_MILLIS = 15L * 60 * 1000;
+    private static final int LOW_BATTERY_CAPACITY_PERCENT = 15;
+    /** When the fitted drift already predicts an error beyond the network
+     * threshold by the next scheduled tick, come back this soon instead. */
+    private static final long EARLY_SYNC_DELAY_MILLIS = 60_000L;
+    private static final long SCREEN_ON_SYNC_DELAY_MILLIS = 5_000L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WindowManager windowManager;
@@ -57,6 +72,7 @@ public final class FloatingClockService extends Service {
     private boolean snapPending;
     private int snapTargetX;
     private int snapTargetY;
+    private boolean overlayRemoved;
 
     private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
         @Override
@@ -66,13 +82,98 @@ public final class FloatingClockService extends Service {
                 // main thread every 50 ms until the screen comes back.
                 screenOn = false;
                 handler.removeCallbacks(ticker);
+                // Periodic sync also stops with the screen off; it is
+                // re-posted on SCREEN_ON below.
+                handler.removeCallbacks(periodicSync);
             } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
                 screenOn = true;
                 handler.removeCallbacks(ticker);
                 handler.post(ticker);
+                handler.removeCallbacks(periodicSync);
+                handler.postDelayed(periodicSync, SCREEN_ON_SYNC_DELAY_MILLIS);
             }
         }
     };
+
+    private final ExecutorService syncWorker = Executors.newSingleThreadExecutor();
+
+    /**
+     * Periodic sync tick, hosted on this service's Handler because it is the
+     * only always-on app component (no WorkManager, no new service). Each
+     * tick refreshes the NTSC NTP reference on a worker thread and asks the
+     * location foreground service for one short GNSS burst; both results
+     * land in the shared drift store as offset samples. The tick never
+     * steps the clock and never runs with the screen off.
+     */
+    private final Runnable periodicSync = new Runnable() {
+        @Override
+        public void run() {
+            handler.removeCallbacks(this);
+            if (!screenOn) return;
+            android.content.SharedPreferences prefs = getSharedPreferences(
+                ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE);
+            long interval = isLowBattery()
+                ? LOW_BATTERY_SYNC_INTERVAL_MILLIS : PERIODIC_SYNC_INTERVAL_MILLIS;
+            if (!ClockDriftEstimator.isPeriodicSyncEnabled(prefs)) {
+                // Switch off: keep re-checking on schedule so turning it back
+                // on takes effect without restarting the service.
+                handler.postDelayed(this, interval);
+                return;
+            }
+            // Normal next run is scheduled first; the worker may pull it
+            // forward to EARLY_SYNC_DELAY_MILLIS if the drift fit predicts
+            // an error beyond the network threshold by then.
+            handler.postDelayed(this, interval);
+            syncWorker.execute(() -> {
+                NtscNtpClient.Result result = NtscNtpClient.query(false);
+                if (result != null && result.success) {
+                    ClockDriftEstimator.recordSample(prefs,
+                        result.queryElapsedRealtimeMillis, result.offsetMillis,
+                        result.uncertaintyMillis, ClockDriftEstimator.SOURCE_NTP);
+                    Log.i(TAG, "periodic sync: source=ntp offset=" + result.offsetMillis
+                        + "ms uncertainty=" + result.uncertaintyMillis
+                        + "ms server=" + result.server);
+                } else {
+                    Log.i(TAG, "periodic sync: ntp query failed: "
+                        + (result == null ? "null" : result.error));
+                }
+                // One short GNSS burst. The burst service is a location
+                // foreground service; starting it from this foreground
+                // service is allowed, and it stops itself after the first
+                // validated raw GnssClock offset or a 60 s timeout.
+                try {
+                    Intent burst = new Intent(FloatingClockService.this,
+                        GnssLocationTrackingService.class)
+                        .setAction(GnssLocationTrackingService.ACTION_PERIODIC_GNSS_BURST);
+                    startForegroundService(burst);
+                } catch (Throwable t) {
+                    Log.i(TAG, "periodic sync: gnss burst start failed: " + t);
+                }
+                ClockDriftEstimator.Estimate estimate = ClockDriftEstimator.estimate(
+                    prefs, SystemClock.elapsedRealtime());
+                if (estimate != null) {
+                    long predicted = ClockDriftEstimator.projectedErrorMillis(estimate,
+                        SystemClock.elapsedRealtime() + interval);
+                    if (predicted
+                            > NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS) {
+                        handler.removeCallbacks(periodicSync);
+                        handler.postDelayed(periodicSync, EARLY_SYNC_DELAY_MILLIS);
+                        Log.i(TAG, "periodic sync: early sync, predicted error " + predicted
+                            + "ms exceeds 50ms network threshold");
+                    }
+                }
+            });
+        }
+    };
+
+    private boolean isLowBattery() {
+        BatteryManager batteryManager = (BatteryManager) getSystemService(BATTERY_SERVICE);
+        if (batteryManager == null) return false;
+        int capacity = batteryManager.getIntProperty(
+            BatteryManager.BATTERY_PROPERTY_CAPACITY);
+        // Unknown capacity reports Integer.MIN_VALUE; that is not low battery.
+        return capacity > 0 && capacity <= LOW_BATTERY_CAPACITY_PERCENT;
+    }
 
     private final Runnable ticker = new Runnable() {
         @Override
@@ -192,6 +293,8 @@ public final class FloatingClockService extends Service {
                 .apply();
             handler.removeCallbacks(ticker);
             handler.post(ticker);
+            handler.removeCallbacks(periodicSync);
+            handler.postDelayed(periodicSync, SCREEN_ON_SYNC_DELAY_MILLIS);
             return START_STICKY;
         } catch (RuntimeException exception) {
             // Keep KEY_ENABLED: a start failure is not the user turning it off.
@@ -239,6 +342,12 @@ public final class FloatingClockService extends Service {
         windowManager.addView(clockContainer, layoutParams);
         // Saved coordinates may be off-screen after rotation or a display change.
         clampPosition(false);
+        overlayRemoved = false;
+        // Fade in on appear (200 ms); skipped when animations are off.
+        if (FloatingClockStyle.animationsEnabled(this)) {
+            clockContainer.setAlpha(0f);
+            clockContainer.animate().alpha(1f).setDuration(200).start();
+        }
         clockContainer.setOnTouchListener(this::handleOverlayTouch);
     }
 
@@ -448,16 +557,39 @@ public final class FloatingClockService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(ticker);
+        handler.removeCallbacks(periodicSync);
+        syncWorker.shutdownNow();
         try {
             unregisterReceiver(screenReceiver);
         } catch (RuntimeException ignored) {
             // Already unregistered, or registration never completed.
         }
         if (clockContainer != null && windowManager != null) {
-            try {
-                windowManager.removeView(clockContainer);
-            } catch (RuntimeException ignored) {
-                // It may already have been removed by the system.
+            final WindowManager wm = windowManager;
+            final View view = clockContainer;
+            if (FloatingClockStyle.animationsEnabled(this)) {
+                // Fade out (150 ms) and only then remove the view. The delayed
+                // fallback covers the case where the animator never fires its
+                // end action; both paths are guarded by overlayRemoved.
+                Runnable removeOverlay = () -> {
+                    if (overlayRemoved) return;
+                    overlayRemoved = true;
+                    try {
+                        wm.removeView(view);
+                    } catch (RuntimeException ignored) {
+                        // It may already have been removed by the system.
+                    }
+                };
+                view.animate().alpha(0f).setDuration(150)
+                    .withEndAction(removeOverlay).start();
+                handler.postDelayed(removeOverlay, 200);
+            } else {
+                try {
+                    wm.removeView(view);
+                } catch (RuntimeException ignored) {
+                    // It may already have been removed by the system.
+                }
+                overlayRemoved = true;
             }
             clockContainer = null;
             secondsView = null;

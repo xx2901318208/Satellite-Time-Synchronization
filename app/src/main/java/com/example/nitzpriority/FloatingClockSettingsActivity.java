@@ -1,5 +1,7 @@
 package com.example.nitzpriority;
 
+import android.animation.ArgbEvaluator;
+import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Color;
@@ -36,6 +38,17 @@ public final class FloatingClockSettingsActivity extends Activity {
     private TextView preview;
     private boolean updatingSwitch;
     private boolean awaitingPermissionForEnable;
+    // Animated preview state: current interpolated values, so a new drag/colour
+    // change starts from where the last animation left off instead of jumping.
+    private ValueAnimator previewStyleAnimator;
+    private boolean previewStyleInitialized;
+    private float animatedTextSize = -1f;
+    private int animatedTextColor;
+    private int animatedTransparency = -1;
+    // Values being dragged on the SeekBars: shown in the local preview only,
+    // written to prefs (and picked up by the running service) on release.
+    private int pendingTextSize = -1;
+    private int pendingTransparency = -1;
 
     private final Runnable previewTicker = new Runnable() {
         @Override
@@ -118,10 +131,19 @@ public final class FloatingClockSettingsActivity extends Activity {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 int value = progress + 16;
                 sizeLabel.setText("字号：" + value + " sp");
-                FloatingClockStyle.preferences(FloatingClockSettingsActivity.this).edit()
-                    .putInt(FloatingClockStyle.KEY_TEXT_SIZE, value).apply();
+                // Dragging only moves the local preview; the value is written to
+                // prefs (and picked up by the running service) when the drag ends.
+                pendingTextSize = value;
                 applyPreviewStyle();
-                notifyRunningService();
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                if (pendingTextSize >= 0) {
+                    FloatingClockStyle.preferences(FloatingClockSettingsActivity.this).edit()
+                        .putInt(FloatingClockStyle.KEY_TEXT_SIZE, pendingTextSize).apply();
+                    notifyRunningService();
+                }
             }
         });
 
@@ -174,10 +196,20 @@ public final class FloatingClockSettingsActivity extends Activity {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 transparencyLabel.setText("背景透明度：" + progress + "%");
-                FloatingClockStyle.preferences(FloatingClockSettingsActivity.this).edit()
-                    .putInt(FloatingClockStyle.KEY_BACKGROUND_TRANSPARENCY, progress).apply();
+                // Dragging only moves the local preview; the value is written to
+                // prefs (and picked up by the running service) when the drag ends.
+                pendingTransparency = progress;
                 applyPreviewStyle();
-                notifyRunningService();
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                if (pendingTransparency >= 0) {
+                    FloatingClockStyle.preferences(FloatingClockSettingsActivity.this).edit()
+                        .putInt(FloatingClockStyle.KEY_BACKGROUND_TRANSPARENCY,
+                            pendingTransparency).apply();
+                    notifyRunningService();
+                }
             }
         });
 
@@ -349,6 +381,13 @@ public final class FloatingClockSettingsActivity extends Activity {
                 updateColorChipSelection(FloatingClockStyle.TEXT_COLORS[index]);
                 applyPreviewStyle();
                 notifyRunningService();
+                // 120 ms press bounce: 0.94x then back to 1.0.
+                if (FloatingClockStyle.animationsEnabled(this)) {
+                    chip.animate().scaleX(0.94f).scaleY(0.94f).setDuration(60)
+                        .withEndAction(() -> chip.animate().scaleX(1f).scaleY(1f)
+                            .setDuration(60).start())
+                        .start();
+                }
             });
         }
         updateColorChipSelection(selected);
@@ -365,8 +404,60 @@ public final class FloatingClockSettingsActivity extends Activity {
         }
     }
 
+    /**
+     * Smooth preview transitions: text size, text color and background
+     * transparency interpolate over one 200 ms animation instead of jumping.
+     * The values are read from the pending drag values while a SeekBar is being
+     * dragged, otherwise from prefs. Skipped (direct apply) on first use and
+     * when animations are off.
+     */
     private void applyPreviewStyle() {
-        if (preview != null) FloatingClockStyle.apply(this, preview);
+        if (preview == null) return;
+        int targetSize = pendingTextSize >= 0 ? pendingTextSize
+            : FloatingClockStyle.textSize(this);
+        int targetColor = FloatingClockStyle.textColor(this);
+        int targetTransparency = pendingTransparency >= 0 ? pendingTransparency
+            : FloatingClockStyle.backgroundTransparency(this);
+        if (!previewStyleInitialized) {
+            previewStyleInitialized = true;
+            animatedTextSize = targetSize;
+            animatedTextColor = targetColor;
+            animatedTransparency = targetTransparency;
+            FloatingClockStyle.apply(this, preview);
+            return;
+        }
+        if (!FloatingClockStyle.animationsEnabled(this)) {
+            animatedTextSize = targetSize;
+            animatedTextColor = targetColor;
+            animatedTransparency = targetTransparency;
+            applyAnimatedPreviewStyle(targetSize, targetColor, targetTransparency);
+            return;
+        }
+        if (previewStyleAnimator != null) previewStyleAnimator.cancel();
+        final float startSize = animatedTextSize;
+        final int startColor = animatedTextColor;
+        final int startTransparency = animatedTransparency;
+        if (startSize == targetSize && startColor == targetColor
+                && startTransparency == targetTransparency) return;
+        final ArgbEvaluator argbEvaluator = new ArgbEvaluator();
+        previewStyleAnimator = ValueAnimator.ofFloat(0f, 1f);
+        previewStyleAnimator.setDuration(200);
+        previewStyleAnimator.addUpdateListener(animation -> {
+            float fraction = animation.getAnimatedFraction();
+            animatedTextSize = startSize + (targetSize - startSize) * fraction;
+            animatedTextColor = (int) argbEvaluator.evaluate(
+                fraction, startColor, targetColor);
+            animatedTransparency = Math.round(startTransparency
+                + (targetTransparency - startTransparency) * fraction);
+            applyAnimatedPreviewStyle(animatedTextSize, animatedTextColor,
+                animatedTransparency);
+        });
+        previewStyleAnimator.start();
+    }
+
+    private void applyAnimatedPreviewStyle(float textSize, int textColor, int transparency) {
+        FloatingClockStyle.applyText(this, preview, textSize, textColor);
+        FloatingClockStyle.applyBackground(this, preview, textColor, transparency);
     }
 
     private void notifyRunningService() {
@@ -398,10 +489,8 @@ public final class FloatingClockSettingsActivity extends Activity {
     private Button button(String value, int background, int foreground) {
         Button view = new Button(this);
         view.setText(value);
-        view.setTextColor(foreground);
-        view.setBackgroundTintList(android.content.res.ColorStateList.valueOf(background));
-        view.setAllCaps(false);
         view.setMinHeight(dp(48));
+        FloatingClockStyle.styleButton(this, view, background, foreground, 0);
         return view;
     }
 

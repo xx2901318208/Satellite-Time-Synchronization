@@ -102,6 +102,17 @@ final class FloatingEventStore {
         return restored;
     }
 
+    /**
+     * Loads events for read-only display. Never returns null: when both the
+     * primary JSON and the backup are unreadable, returns an empty list so
+     * display paths cannot throw NullPointerException. Callers that mutate
+     * (save/delete) must use {@link #load(Context)} directly and handle null.
+     */
+    static List<Event> loadOrEmpty(Context context) {
+        List<Event> events = load(context);
+        return events == null ? new ArrayList<>() : events;
+    }
+
     static Event find(Context context, String id) {
         if (id == null || id.isEmpty()) return null;
         List<Event> events = load(context);

@@ -7,5 +7,15 @@
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:navigationBarColor">#F4F7FB</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <!-- Slide transitions for every activity at once; the system skips them
+            when the user turns animations off (window animation scale = 0). -->
+        <item name="android:windowAnimationStyle">@style/SlideActivityAnimation</item>
+    </style>
+
+    <style name="SlideActivityAnimation" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/slide_in_right</item>
+        <item name="android:activityOpenExitAnimation">@anim/slide_out_left</item>
+        <item name="android:activityCloseEnterAnimation">@anim/slide_in_left</item>
+        <item name="android:activityCloseExitAnimation">@anim/slide_out_right</item>
     </style>
 </resources>

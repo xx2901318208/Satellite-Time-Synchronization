@@ -348,7 +348,13 @@ public final class FloatingEventActivity extends Activity {
         long now = System.currentTimeMillis();
         List<FloatingEventStore.Event> upcoming = new ArrayList<>();
         List<FloatingEventStore.Event> finished = new ArrayList<>();
-        for (FloatingEventStore.Event event : FloatingEventStore.load(this)) {
+        List<FloatingEventStore.Event> events = FloatingEventStore.load(this);
+        if (events == null) {
+            // Both copies unreadable: show an empty list instead of crashing.
+            events = new ArrayList<>();
+            Toast.makeText(this, "事件数据损坏，已清空显示", Toast.LENGTH_LONG).show();
+        }
+        for (FloatingEventStore.Event event : events) {
             if (event.targetTimeMillis > now) upcoming.add(event); else finished.add(event);
         }
         Collections.sort(upcoming, Comparator.comparingLong(e -> e.targetTimeMillis));
@@ -438,7 +444,8 @@ public final class FloatingEventActivity extends Activity {
         if (nextEventView == null) return;
         long now = System.currentTimeMillis();
         FloatingEventStore.Event next = null;
-        for (FloatingEventStore.Event event : FloatingEventStore.load(this)) {
+        // No toast here: the 250 ms ticker calls this, a toast would spam.
+        for (FloatingEventStore.Event event : FloatingEventStore.loadOrEmpty(this)) {
             if (event.targetTimeMillis > now && (next == null
                     || event.targetTimeMillis < next.targetTimeMillis)) next = event;
         }
@@ -571,6 +578,12 @@ public final class FloatingEventActivity extends Activity {
                 }
                 int reminder = REMINDER_MINUTES[reminderChoice.getSelectedItemPosition()];
                 List<FloatingEventStore.Event> events = FloatingEventStore.load(this);
+                if (events == null) {
+                    // Both copies unreadable: refuse to save rather than
+                    // silently dropping the new event (save() would refuse too).
+                    Toast.makeText(this, "事件数据损坏，已清空显示", Toast.LENGTH_LONG).show();
+                    return;
+                }
                 String id = existing == null
                     ? Long.toString(System.currentTimeMillis()) + "-" + android.os.SystemClock.elapsedRealtime()
                     : existing.id;
@@ -614,6 +627,7 @@ public final class FloatingEventActivity extends Activity {
             .setNegativeButton("取消", null)
             .setPositiveButton("删除", (dialog, which) -> {
                 List<FloatingEventStore.Event> events = FloatingEventStore.load(this);
+                if (events == null) events = new ArrayList<>();
                 List<FloatingEventStore.Event> remaining = new ArrayList<>();
                 for (FloatingEventStore.Event item : events) {
                     if (!item.id.equals(event.id)) remaining.add(item);
@@ -640,10 +654,8 @@ public final class FloatingEventActivity extends Activity {
     private Button button(String label, int background, int foreground) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextColor(foreground);
-        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(background));
-        button.setAllCaps(false);
         button.setMinHeight(dp(48));
+        FloatingClockStyle.styleButton(this, button, background, foreground, 0);
         return button;
     }
 

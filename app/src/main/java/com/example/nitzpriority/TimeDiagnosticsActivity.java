@@ -4,7 +4,6 @@ import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -24,6 +23,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -248,6 +248,41 @@ public final class TimeDiagnosticsActivity extends Activity {
         thresholdHint.setPadding(dp(4), dp(4), dp(4), dp(2));
         thresholdCard.addView(thresholdHint, new LinearLayout.LayoutParams(-1, -2));
 
+        // Periodic sync switch: every 5 minutes (15 on low battery) while the
+        // screen is on, refresh the NTSC reference and request one GNSS sample,
+        // so the clock does not drift unchecked between manual refreshes.
+        // The tick itself runs in FloatingClockService, so background sync only
+        // happens while the floating clock is enabled; opening this page already
+        // samples about once a minute through its own 60 s refresh.
+        LinearLayout syncCard = new LinearLayout(this);
+        syncCard.setOrientation(LinearLayout.VERTICAL);
+        syncCard.setPadding(dp(14), dp(10), dp(14), dp(10));
+        syncCard.setBackground(glassCardBackground());
+        syncCard.setElevation(dp(3));
+        LinearLayout.LayoutParams syncCardParams = new LinearLayout.LayoutParams(-1, -2);
+        syncCardParams.setMargins(dp(12), dp(8), dp(12), 0);
+        root.addView(syncCard, syncCardParams);
+        Switch syncSwitch = new Switch(this);
+        syncSwitch.setText("定期同步（每 5 分钟）");
+        syncSwitch.setTextSize(14);
+        syncSwitch.setTypeface(null, android.graphics.Typeface.BOLD);
+        syncSwitch.setTextColor(Color.rgb(37, 48, 66));
+        syncSwitch.setChecked(getSharedPreferences(ClockDriftEstimator.PREFS_NAME,
+            MODE_PRIVATE).getBoolean(ClockDriftEstimator.KEY_PERIODIC_SYNC_ENABLED, true));
+        syncCard.addView(syncSwitch, new LinearLayout.LayoutParams(-1, -2));
+        TextView syncHint = new TextView(this);
+        syncHint.setText("亮屏时每 5 分钟查一次授时中心 NTP 并请求一次 GNSS 样本；低电量时降为 15 分钟。仅在悬浮时钟开启时后台运行。漂移估计随样本过期失效，关掉后不再定期同步。");
+        syncHint.setTextSize(12);
+        syncHint.setTextColor(Color.rgb(104, 117, 138));
+        syncHint.setPadding(dp(4), dp(4), dp(4), dp(2));
+        syncCard.addView(syncHint, new LinearLayout.LayoutParams(-1, -2));
+        syncSwitch.setOnCheckedChangeListener((buttonView, checked) -> {
+            getSharedPreferences(ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(ClockDriftEstimator.KEY_PERIODIC_SYNC_ENABLED, checked).apply();
+            Toast.makeText(this, checked ? "定期同步已开启" : "定期同步已关闭",
+                Toast.LENGTH_SHORT).show();
+        });
+
         webView = new WebView(this);
         webView.setBackgroundColor(Color.TRANSPARENT);
         WebSettings settings = webView.getSettings();
@@ -292,10 +327,7 @@ public final class TimeDiagnosticsActivity extends Activity {
     }
 
     private void styleButton(Button button, int backgroundColor, int textColor) {
-        button.setBackgroundTintList(ColorStateList.valueOf(backgroundColor));
-        button.setTextColor(textColor);
-        button.setAllCaps(false);
-        button.setElevation(dp(2));
+        FloatingClockStyle.styleButton(this, button, backgroundColor, textColor, 2);
     }
 
     private void styleSystemBars() {
@@ -513,13 +545,33 @@ public final class TimeDiagnosticsActivity extends Activity {
             String nitzCalibrationStatus = calibrationParts.length > 1
                 ? calibrationParts[1].trim() : "";
             boolean hasRoot = result.exitCode == 0 && identity.contains("uid=0");
-            recordGnssTrendPoint(timeDump);
+            // Drift samples come from the same refresh that draws the page:
+            // the fresh GNSS trend point and the independent NTSC result are
+            // both (reference - phone) offsets at an elapsed instant. The
+            // estimator only displays drift and triggers an early sync; it
+            // never steps the clock on a prediction.
+            android.content.SharedPreferences settingsPrefs = getSharedPreferences(
+                ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE);
+            TrendPoint newTrendPoint = recordGnssTrendPoint(timeDump);
             long trendNowElapsed = parseLong(ELAPSED_PATTERN, timeDump, -1);
+            if (newTrendPoint != null && trendNowElapsed >= 0) {
+                long gnssAge = Math.max(0L,
+                    trendNowElapsed - newTrendPoint.elapsedRealtimeMillis);
+                ClockDriftEstimator.recordSample(settingsPrefs,
+                    newTrendPoint.elapsedRealtimeMillis, newTrendPoint.offsetMillis,
+                    uncertaintyFor("GNSS 卫星", gnssAge, -1),
+                    ClockDriftEstimator.SOURCE_GNSS);
+            }
             List<TrendPoint> trendPoints = loadGnssTrendPoints(trendNowElapsed);
             // Independent NTSC reference: plain UDP NTP on this worker thread,
             // never on the main thread. Does not need root and does not touch
             // the system clock, the detector, or the force-jump flow.
             NtscNtpClient.Result ntscResult = NtscNtpClient.query(forceNtsc);
+            if (ntscResult != null && ntscResult.success) {
+                ClockDriftEstimator.recordSample(settingsPrefs,
+                    ntscResult.queryElapsedRealtimeMillis, ntscResult.offsetMillis,
+                    ntscResult.uncertaintyMillis, ClockDriftEstimator.SOURCE_NTP);
+            }
             String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
                 calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
                 forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
@@ -592,6 +644,8 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append(".warn{color:#9b5e00}.good{color:#167343}.fail{color:#b42318}.running{color:#1769d2}")
             .append(".summary{font-size:13px;line-height:1.55;color:#526e84}.details{margin-top:16px}")
             .append(".details summary{font-size:13px;font-weight:750;color:#315f7a;padding:10px 0;cursor:pointer}")
+            .append("details[open] summary ~ *{animation:fadeSlide .25s ease}")
+            .append("@keyframes fadeSlide{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}")
             .append(".details pre{white-space:pre-wrap;word-break:break-word;font:11px/1.5 monospace;background:linear-gradient(145deg,#132b41,#1d4056);color:#d9eff9;"
                 + "padding:13px;border:1px solid rgba(255,255,255,.18);border-radius:16px;max-height:360px;overflow:auto}")
             .append(".foot{font-size:11px;color:#6c8499;line-height:1.6;text-align:center;margin:18px 4px 8px}")
@@ -692,6 +746,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append(gnssSyncCard(gnssDisplay, nowElapsed, systemUnix, autoEnabled, priorities,
                 timeDump, networkDisplay, calibrationState, calibrationStartElapsed))
             .append(gnssTrendCard(trendPoints, nowElapsed))
+            .append(driftCard(nowElapsed))
             .append(beijingTimeCard(networkDisplay, networkUncertainty, nowElapsed, systemUnix))
             .append(ntscTimeCard(ntscResult))
             .append(calibrationCard(calibrationState, calibrationDetail, calibrationTime))
@@ -827,7 +882,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         } else {
             detail += " 未能确认系统自动授时开关状态。";
         }
-        String clockSetStatus = gnssClockSetStatus(timeDump, network, calibrationState,
+        String clockSetStatus = gnssClockSetStatus(timeDump, calibrationState,
             calibrationStartElapsed, nowElapsed);
         return "<div class='card'><div class='sync-title " + css + "'>"
             + escape(title) + "</div><div class='sync-detail'>" + escape(detail)
@@ -959,7 +1014,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         return html.append("</div>").toString();
     }
 
-    private static String gnssClockSetStatus(String timeDump, Sample network,
+    private static String gnssClockSetStatus(String timeDump,
             String calibrationState, long operationStartElapsed, long nowElapsed) {
         if (operationStartElapsed <= 0 || nowElapsed < operationStartElapsed) {
             return "无法确认（缺少本次操作时间基线，请重新执行一次校准）";
@@ -1008,14 +1063,14 @@ public final class TimeDiagnosticsActivity extends Activity {
         return "未发现本次操作后的 GNSS 实际改时记录";
     }
 
-    private void recordGnssTrendPoint(String timeDump) {
+    private TrendPoint recordGnssTrendPoint(String timeDump) {
         long nowElapsed = parseLong(ELAPSED_PATTERN, timeDump, -1L);
         long systemUnix = parseLong(SYSTEM_TIME_PATTERN, timeDump, -1L);
         Sample gnss = findLatestSample(timeDump, "GnssTimeSuggestion");
         if (nowElapsed < 0 || systemUnix < 0 || gnss == null
-                || nowElapsed < gnss.elapsedRealtimeMillis) return;
+                || nowElapsed < gnss.elapsedRealtimeMillis) return null;
         long age = nowElapsed - gnss.elapsedRealtimeMillis;
-        if (age > GNSS_SYNC_MAX_SAMPLE_AGE_MILLIS) return;
+        if (age > GNSS_SYNC_MAX_SAMPLE_AGE_MILLIS) return null;
         long offset = gnss.unixEpochTimeMillis + age - systemUnix;
 
         android.content.SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
@@ -1023,11 +1078,13 @@ public final class TimeDiagnosticsActivity extends Activity {
         if (!points.isEmpty()) {
             long lastElapsed = points.get(points.size() - 1).elapsedRealtimeMillis;
             if (nowElapsed < lastElapsed) points.clear(); // elapsedRealtime reset after reboot.
-            else if (nowElapsed - lastElapsed < GNSS_TREND_MIN_INTERVAL_MILLIS) return;
+            else if (nowElapsed - lastElapsed < GNSS_TREND_MIN_INTERVAL_MILLIS) return null;
         }
-        points.add(new TrendPoint(nowElapsed, offset));
+        TrendPoint point = new TrendPoint(nowElapsed, offset);
+        points.add(point);
         pruneTrendPoints(points, nowElapsed);
         prefs.edit().putString(GNSS_TREND_PREF, serializeTrendPoints(points)).apply();
+        return point;
     }
 
     private List<TrendPoint> loadGnssTrendPoints(long nowElapsed) {
@@ -1148,6 +1205,60 @@ public final class TimeDiagnosticsActivity extends Activity {
         if (offsetMillis > 0) return "本机落后 GNSS 约 " + magnitude + " 毫秒";
         if (offsetMillis < 0) return "本机领先 GNSS 约 " + magnitude + " 毫秒";
         return "本机与 GNSS 基本一致";
+    }
+
+    /**
+     * Drift estimate card. Shows the fitted crystal drift in ppm and the
+     * predicted current error, or why no fit exists yet. The prediction is
+     * display only: nothing in this app steps the clock from a predicted
+     * value (see ClockDriftEstimator).
+     */
+    private String driftCard(long nowElapsed) {
+        android.content.SharedPreferences prefs = getSharedPreferences(
+            ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE);
+        StringBuilder card = new StringBuilder("<div class='card'><div class='name'>时钟漂移估计</div>")
+            .append("<div class='meta'>用最近 1 小时内的 GNSS / 授时中心偏移样本做线性回归；只用于显示与提前同步，不直接改时钟。</div>");
+        boolean periodicOn = ClockDriftEstimator.isPeriodicSyncEnabled(prefs);
+        card.append("<div class='small'>定期同步：")
+            .append(periodicOn ? "开启（亮屏时每 5 分钟，低电量 15 分钟）" : "已关闭")
+            .append("</div>");
+        if (nowElapsed < 0) {
+            return card.append("<div class='trend-empty'>暂无系统授时数据，无法估计漂移。</div></div>")
+                .toString();
+        }
+        ClockDriftEstimator.Estimate estimate =
+            ClockDriftEstimator.estimate(prefs, nowElapsed);
+        if (estimate == null) {
+            ClockDriftEstimator.Summary summary =
+                ClockDriftEstimator.summary(prefs, nowElapsed);
+            if (summary.newestAgeMillis < 0) {
+                card.append("<div class='trend-empty'>暂无漂移样本；保持诊断页打开或开启定期同步，采集到 3 个点（跨度 10 分钟以上）后显示。</div>");
+            } else if (summary.newestAgeMillis > ClockDriftEstimator.MAX_SAMPLE_AGE_MILLIS) {
+                card.append("<div class='trend-empty'>漂移估计已过期：最近样本在 ")
+                    .append(escape(formatAge(summary.newestAgeMillis)))
+                    .append("前，超过 1 小时无新鲜样本。刷新一次或等定期同步采到新样本。</div>");
+            } else {
+                card.append("<div class='trend-empty'>采集中：已收 ")
+                    .append(summary.pointCount).append(" 个点，跨度 ")
+                    .append(escape(formatAge(summary.spanMillis)))
+                    .append("；需要 3 个点且跨度 10 分钟以上。</div>");
+            }
+            return card.append("</div>").toString();
+        }
+        long predictedError = ClockDriftEstimator.projectedErrorMillis(estimate, nowElapsed);
+        long predictedOffset = ClockDriftEstimator.projectedOffsetMillis(estimate, nowElapsed);
+        String direction = estimate.ppm > 0 ? "（手机走慢）" : estimate.ppm < 0 ? "（手机走快）" : "";
+        card.append("<div class='trend-latest'>漂移 ")
+            .append(String.format(Locale.US, "%+.1f", estimate.ppm)).append(" ppm ")
+            .append(escape(direction)).append("</div>")
+            .append("<div class='sync-detail'>基于 ").append(estimate.pointCount)
+            .append(" 个点，跨度 ").append(escape(formatAge(estimate.spanMillis)))
+            .append("；按此推算，当前误差约 ")
+            .append(predictedOffset >= 0 ? "落后 " : "领先 ")
+            .append(Math.abs(predictedOffset)).append(" 毫秒 ±")
+            .append(predictedError).append(" 毫秒。</div>")
+            .append("<div class='small'>预测误差超过网络门槛（50ms）时，定期同步会提前触发一次；预测值本身不用于改时钟。</div>");
+        return card.append("</div>").toString();
     }
 
     private static List<ClockSetEvent> findClockSetEvents(String dump) {

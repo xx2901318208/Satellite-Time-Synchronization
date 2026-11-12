@@ -1,12 +1,17 @@
 package com.example.nitzpriority;
 
+import android.animation.ObjectAnimator;
+import android.animation.StateListAnimator;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.provider.Settings;
 import android.view.View;
+import android.widget.Button;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
@@ -65,8 +70,13 @@ final class FloatingClockStyle {
 
     /** Text size / color / typeface only; the overlay splits seconds and millis into two views. */
     static void applyText(Context context, TextView view) {
-        view.setTextSize(textSize(context));
-        view.setTextColor(textColor(context));
+        applyText(context, view, textSize(context), textColor(context));
+    }
+
+    /** Explicit-value variant so the settings preview can interpolate size/color per frame. */
+    static void applyText(Context context, TextView view, float textSizeSp, int textColor) {
+        view.setTextSize(textSizeSp);
+        view.setTextColor(textColor);
         // Monospace digits: in a proportional font '1' is narrower than '8', so the
         // whole string wobbles left-right every frame as the millis digits change.
         view.setTypeface(Typeface.MONOSPACE);
@@ -75,21 +85,59 @@ final class FloatingClockStyle {
 
     /** Background, padding and elevation only; shared by the settings preview TextView and the overlay container. */
     static void applyBackground(Context context, View view) {
-        int color = textColor(context);
-        int transparency = backgroundTransparency(context);
+        applyBackground(context, view, textColor(context), backgroundTransparency(context));
+    }
+
+    /** Explicit-value variant so the settings preview can interpolate transparency per frame. */
+    static void applyBackground(Context context, View view, int textColor, int transparency) {
         int padding = dp(context, 13);
         view.setPadding(padding, dp(context, 8), padding, dp(context, 8));
 
-        int backgroundRgb = isDark(color) ? 0xFFF4F8FC : 0xFF10243A;
+        int backgroundRgb = isDark(textColor) ? 0xFFF4F8FC : 0xFF10243A;
         int alpha = Math.round(255f * (100 - transparency) / 100f);
         GradientDrawable background = new GradientDrawable();
         background.setColor(Color.argb(alpha, Color.red(backgroundRgb),
             Color.green(backgroundRgb), Color.blue(backgroundRgb)));
         background.setCornerRadius(dp(context, 18));
         background.setStroke(dp(context, 1), Color.argb(Math.min(220, alpha),
-            isDark(color) ? 120 : 230, isDark(color) ? 155 : 245, isDark(color) ? 185 : 255));
+            isDark(textColor) ? 120 : 230, isDark(textColor) ? 155 : 245, isDark(textColor) ? 185 : 255));
         view.setBackground(background);
         view.setElevation(dp(context, 8));
+    }
+
+    /**
+     * Shared button styling: tinted background, ripple press feedback and a slight
+     * sink on press. The ripple is drawn in the foreground (a code-built
+     * RippleDrawable with a rounded mask) so the existing tinted background,
+     * padding and shape stay exactly as they were; only the press feedback is new.
+     * The press sink is a StateListAnimator on elevation (base - 2dp while pressed),
+     * replacing the stock Material lift.
+     */
+    static void styleButton(Context context, Button button, int backgroundColor, int textColor,
+            int baseElevationDp) {
+        button.setBackgroundTintList(ColorStateList.valueOf(backgroundColor));
+        button.setTextColor(textColor);
+        button.setAllCaps(false);
+        button.setElevation(dp(context, baseElevationDp));
+
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(Color.WHITE);
+        mask.setCornerRadius(dp(context, 4));
+        int rippleColor = isDark(backgroundColor) ? 0x3DFFFFFF : 0x32000000;
+        RippleDrawable foreground = new RippleDrawable(
+            ColorStateList.valueOf(rippleColor), null, mask);
+        button.setForeground(foreground);
+
+        StateListAnimator pressAnimator = new StateListAnimator();
+        ObjectAnimator pressed = ObjectAnimator.ofFloat(button, "elevation",
+            dp(context, Math.max(0, baseElevationDp - 2)));
+        pressed.setDuration(90);
+        ObjectAnimator released = ObjectAnimator.ofFloat(button, "elevation",
+            dp(context, baseElevationDp));
+        released.setDuration(90);
+        pressAnimator.addState(new int[] {android.R.attr.state_pressed}, pressed);
+        pressAnimator.addState(new int[] {}, released);
+        button.setStateListAnimator(pressAnimator);
     }
 
     /**

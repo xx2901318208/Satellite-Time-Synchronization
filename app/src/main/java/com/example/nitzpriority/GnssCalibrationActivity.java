@@ -1,9 +1,11 @@
 package com.example.nitzpriority;
 
 import android.Manifest;
+import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.PorterDuff;
 import android.location.Location;
 import android.location.LocationManager;
 import android.os.Build;
@@ -11,10 +13,13 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.transition.AutoTransition;
+import android.transition.TransitionManager;
 import android.view.View;
 import android.widget.ScrollView;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import java.util.concurrent.ExecutorService;
@@ -43,11 +48,16 @@ public final class GnssCalibrationActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
+    private LinearLayout contentLayout;
     private TextView statusView;
+    private android.graphics.drawable.GradientDrawable statusBackground;
+    private ProgressBar calibrationProgress;
     private TextView satelliteView;
     private TextView satelliteDetailsView;
     private TextView rawClockView;
     private TextView rawClockDetailsView;
+    private int lastVisibleSatellites = -1;
+    private int lastUsedSatellites = -1;
     private boolean satelliteDetailsExpanded;
     private boolean rawClockDetailsExpanded;
     private Button triggerButton;
@@ -79,6 +89,7 @@ public final class GnssCalibrationActivity extends Activity {
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(dp(22), dp(26), dp(22), dp(28));
         page.addView(layout, new ScrollView.LayoutParams(-1, -2));
+        contentLayout = layout;
 
         TextView title = new TextView(this);
         title.setText("卫星对时");
@@ -152,19 +163,29 @@ public final class GnssCalibrationActivity extends Activity {
         floatingClockButton.setOnClickListener(view ->
             startActivity(new Intent(this, FloatingClockSettingsActivity.class)));
 
+        // Determinate 0-300 s bar for the 5-minute wait: only setProgress() moves it,
+        // the status text below keeps changing on its own. Hidden until a run starts.
+        calibrationProgress = new ProgressBar(this, null,
+            android.R.attr.progressBarStyleHorizontal);
+        calibrationProgress.setMax(300);
+        calibrationProgress.setProgress(0);
+        calibrationProgress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, dp(6));
+        progressParams.topMargin = dp(24);
+        layout.addView(calibrationProgress, progressParams);
+
         statusView = new TextView(this);
         statusView.setTextSize(14);
         statusView.setTextColor(0xFF354258);
         statusView.setLineSpacing(dp(3), 1f);
         statusView.setPadding(dp(16), dp(14), dp(16), dp(14));
-        android.graphics.drawable.GradientDrawable statusBackground =
-            glassCardBackground(0xE8E3F4FF, 0xD5E7F2FF);
+        statusBackground = glassCardBackground(0xE8E3F4FF, 0xD5E7F2FF);
         statusView.setBackground(statusBackground);
         statusView.setElevation(dp(4));
         statusView.setText("准备就绪\n开启系统定位后，点击上方按钮获取新的 GNSS 时间样本。");
         statusView.setTextIsSelectable(true);
         LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
-        statusParams.topMargin = dp(24);
+        statusParams.topMargin = dp(8);
         layout.addView(statusView, statusParams);
 
         satelliteView = new TextView(this);
@@ -232,10 +253,7 @@ public final class GnssCalibrationActivity extends Activity {
     }
 
     private void styleButton(Button button, int backgroundColor, int textColor) {
-        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(backgroundColor));
-        button.setTextColor(textColor);
-        button.setAllCaps(false);
-        button.setElevation(dp(2));
+        FloatingClockStyle.styleButton(this, button, backgroundColor, textColor, 2);
     }
 
     private void styleSystemBars() {
@@ -270,12 +288,19 @@ public final class GnssCalibrationActivity extends Activity {
 
     private void toggleSatelliteDetails() {
         satelliteDetailsExpanded = !satelliteDetailsExpanded;
+        // Height animation for the expand/collapse; skipped when animations are off.
+        if (contentLayout != null && FloatingClockStyle.animationsEnabled(this)) {
+            TransitionManager.beginDelayedTransition(contentLayout, new AutoTransition());
+        }
         satelliteDetailsView.setVisibility(satelliteDetailsExpanded ? View.VISIBLE : View.GONE);
         updateSatelliteDiagnosticsView();
     }
 
     private void toggleRawClockDetails() {
         rawClockDetailsExpanded = !rawClockDetailsExpanded;
+        if (contentLayout != null && FloatingClockStyle.animationsEnabled(this)) {
+            TransitionManager.beginDelayedTransition(contentLayout, new AutoTransition());
+        }
         rawClockDetailsView.setVisibility(rawClockDetailsExpanded ? View.VISIBLE : View.GONE);
         updateRawClockDiagnosticsView();
     }
@@ -347,6 +372,12 @@ public final class GnssCalibrationActivity extends Activity {
         lastGpsAccuracy = "未知";
         triggerToken = Long.toString(SystemClock.elapsedRealtimeNanos());
         triggerButton.setEnabled(false);
+        if (calibrationProgress != null) {
+            calibrationProgress.setProgress(0);
+            calibrationProgress.setVisibility(View.VISIBLE);
+        }
+        // Fresh run: drop the previous result's green/red tint.
+        if (statusBackground != null) statusBackground.setColorFilter(null);
         saveCalibrationResult("RUNNING", "本次校准已重置应用内旧结果；只统计点击后到达的新 GNSS 建议。");
         stopButton.setVisibility(View.VISIBLE);
         setStatus("正在启动 GNSS 监听…最多等待 5 分钟。");
@@ -481,6 +512,12 @@ public final class GnssCalibrationActivity extends Activity {
     private void updateGnssProgress(GnssSnapshot snapshot) {
         updateSatelliteDiagnosticsView();
         updateRawClockDiagnosticsView();
+        // Only the bar moves here; the status text is updated below.
+        if (calibrationProgress != null) {
+            long elapsedSeconds = Math.max(0L,
+                (SystemClock.elapsedRealtime() - operationStartElapsedMillis) / 1_000L);
+            calibrationProgress.setProgress((int) Math.min(300L, elapsedSeconds));
+        }
         long remaining = Math.max(0L,
             operationDeadlineElapsedMillis - SystemClock.elapsedRealtime());
         long remainingSeconds = (remaining + 999L) / 1_000L;
@@ -540,6 +577,17 @@ public final class GnssCalibrationActivity extends Activity {
         } else {
             int visible = prefs.getInt("visible_satellites", 0);
             int used = prefs.getInt("used_satellites", 0);
+            // Small 150 ms bounce when the satellite count itself changes; the
+            // text is rewritten every poll, so only a real count change animates.
+            if ((visible != lastVisibleSatellites || used != lastUsedSatellites)
+                    && FloatingClockStyle.animationsEnabled(this)) {
+                satelliteView.animate().scaleX(1.06f).scaleY(1.06f).setDuration(75)
+                    .withEndAction(() -> satelliteView.animate().scaleX(1f).scaleY(1f)
+                        .setDuration(75).start())
+                    .start();
+            }
+            lastVisibleSatellites = visible;
+            lastUsedSatellites = used;
             summary.append("可见 ").append(visible).append(" 颗 · 参与定位 ")
                 .append(used).append(" 颗");
             String[] keys = {"gps", "beidou", "glonass", "galileo", "qzss", "sbas", "irnss", "unknown"};
@@ -745,6 +793,8 @@ public final class GnssCalibrationActivity extends Activity {
         stopService(new Intent(this, GnssLocationTrackingService.class));
         if (triggerButton != null) triggerButton.setEnabled(true);
         if (stopButton != null) stopButton.setVisibility(View.GONE);
+        if (calibrationProgress != null) calibrationProgress.setVisibility(View.GONE);
+        animateStatusResult(state);
         saveCalibrationResult(state, message);
         String prefix;
         if ("SUCCESS".equals(state)) prefix = "授时请求完成：";
@@ -760,6 +810,35 @@ public final class GnssCalibrationActivity extends Activity {
 
     private void setStatus(String message) {
         if (!activityDestroyed && statusView != null) statusView.setText(message);
+    }
+
+    /**
+     * Result tint for the status card: fades a green tint in on success, a red
+     * tint on failure, and clears the tint for partial/cancelled results.
+     * Implemented as an animated SRC_ATOP color filter over the card gradient,
+     * so the gradient itself is never rebuilt per frame.
+     */
+    private void animateStatusResult(String state) {
+        if (statusView == null || statusBackground == null) return;
+        int target;
+        if ("SUCCESS".equals(state)) {
+            target = 0x5522C55E;
+        } else if ("FAILED".equals(state) || "NO_LOCATION_TIME".equals(state)
+                || "STALE_LOCATION_TIME".equals(state) || "UNVERIFIED".equals(state)) {
+            target = 0x55DC2626;
+        } else {
+            statusBackground.setColorFilter(null);
+            return;
+        }
+        if (!FloatingClockStyle.animationsEnabled(this)) {
+            statusBackground.setColorFilter(target, PorterDuff.Mode.SRC_ATOP);
+            return;
+        }
+        ValueAnimator animator = ValueAnimator.ofArgb(0x00000000, target);
+        animator.setDuration(300);
+        animator.addUpdateListener(animation -> statusBackground.setColorFilter(
+            (int) animation.getAnimatedValue(), PorterDuff.Mode.SRC_ATOP));
+        animator.start();
     }
 
     private void signalRecoveryCancellation() {
