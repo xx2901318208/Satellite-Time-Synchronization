@@ -27,6 +27,11 @@ final class GnssTriggerBridge {
     static final String FORCE_RESULT_PROPERTY = "debug.nitz.force_result";
     private static final long MIN_FORCE_TIME_MILLIS = 1_577_836_800_000L; // 2020-01-01
     private static final long MAX_FORCE_TIME_MILLIS = 4_102_444_800_000L; // 2100-01-01
+    // Hard cap on one forced jump, enforced here as well as in the UI: a forged
+    // property value must never reach setCurrentTimeMillis.
+    private static final long MAX_FORCE_JUMP_MILLIS = 60_000L;
+    // Tolerance when verifying a void setCurrentTimeMillis by reading the clock.
+    private static final long FORCE_CLOCK_VERIFY_TOLERANCE_MILLIS = 1_000L;
 
     private final AtomicBoolean triggerPending = new AtomicBoolean(false);
     private volatile ClassLoader systemServerClassLoader;
@@ -137,6 +142,9 @@ final class GnssTriggerBridge {
 
                         Object forceObject = getProperty.invoke(null, FORCE_TIME_PROPERTY, "");
                         String forceValue = forceObject == null ? "" : forceObject.toString();
+                        // An empty value means "already consumed" (see clearForceRequest):
+                        // keep lastForceTimeValue so replaying the identical request
+                        // string is still recognised as a duplicate and ignored.
                         if (!forceValue.isEmpty()) {
                             boolean changed;
                             synchronized (GnssTriggerBridge.this) {
@@ -439,6 +447,7 @@ final class GnssTriggerBridge {
         String[] parts = request.split(":", 2);
         if (parts.length != 2 || parts[0].isEmpty()) {
             XposedBridge.log(TAG + ": malformed force-time request rejected");
+            clearForceRequest(setProperty);
             return;
         }
         final String token = parts[0];
@@ -447,11 +456,23 @@ final class GnssTriggerBridge {
             targetMillis = Long.parseLong(parts[1]);
         } catch (NumberFormatException e) {
             writeForceResult(setProperty, token, false);
+            clearForceRequest(setProperty);
             return;
         }
         if (targetMillis < MIN_FORCE_TIME_MILLIS || targetMillis > MAX_FORCE_TIME_MILLIS) {
             XposedBridge.log(TAG + ": force-time target rejected by date bounds");
             writeForceResult(setProperty, token, false);
+            clearForceRequest(setProperty);
+            return;
+        }
+        // Server-side amplitude cap: the UI also refuses jumps over 60 s, but a
+        // forged property value must never reach setCurrentTimeMillis.
+        long jumpMillis = targetMillis - System.currentTimeMillis();
+        if (Math.abs(jumpMillis) > MAX_FORCE_JUMP_MILLIS) {
+            XposedBridge.log(TAG + ": force-time target rejected: jump " + jumpMillis
+                + " ms exceeds " + MAX_FORCE_JUMP_MILLIS + " ms cap");
+            writeForceResult(setProperty, token, false);
+            clearForceRequest(setProperty);
             return;
         }
 
@@ -467,15 +488,37 @@ final class GnssTriggerBridge {
                         "setCurrentTimeMillis", long.class);
                     setCurrentTimeMillis.setAccessible(true);
                     Object result = setCurrentTimeMillis.invoke(null, targetMillis);
-                    success = !(result instanceof Boolean) || ((Boolean) result).booleanValue();
+                    Class<?> returnType = setCurrentTimeMillis.getReturnType();
+                    if (returnType == boolean.class || returnType == Boolean.class) {
+                        success = Boolean.TRUE.equals(result);
+                    } else if (returnType == void.class) {
+                        // A void method returns nothing to trust: verify the clock
+                        // actually moved instead of treating "no return" as success.
+                        long nowMillis = System.currentTimeMillis();
+                        success = Math.abs(nowMillis - targetMillis)
+                            < FORCE_CLOCK_VERIFY_TOLERANCE_MILLIS;
+                        XposedBridge.log(TAG + ": force-time void return; verify now="
+                            + nowMillis + " target=" + targetMillis
+                            + " success=" + success);
+                    } else {
+                        XposedBridge.log(TAG + ": force-time unexpected "
+                            + "setCurrentTimeMillis return type: " + returnType);
+                        success = false;
+                    }
                     XposedBridge.log(TAG + ": confirmed force-time request result=" + success);
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + ": force-time request failed safely: " + t);
                 }
                 writeForceResult(setProperty, token, success);
+                // Consume the request so a stale value can never be replayed
+                // after a system_server restart (lastForceTimeValue is in-memory
+                // only). The app reads the result from FORCE_RESULT_PROPERTY,
+                // which is untouched by this clear.
+                clearForceRequest(setProperty);
             }
         })) {
             writeForceResult(setProperty, token, false);
+            clearForceRequest(setProperty);
         }
     }
 
@@ -485,6 +528,15 @@ final class GnssTriggerBridge {
                 token + (success ? ":OK" : ":FAIL"));
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": could not publish force-time result: " + t);
+        }
+    }
+
+    /** Clears the request property once a force-time request has been handled. */
+    private static void clearForceRequest(Method setProperty) {
+        try {
+            setProperty.invoke(null, FORCE_TIME_PROPERTY, "");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": could not clear force-time request: " + t);
         }
     }
 

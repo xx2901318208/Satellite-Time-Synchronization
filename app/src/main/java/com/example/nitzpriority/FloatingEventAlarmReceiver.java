@@ -35,6 +35,46 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
     private static Vibrator activeVibrator;
     private static final Set<Integer> ACTIVE_ALERT_NOTIFICATIONS =
         Collections.synchronizedSet(new HashSet<>());
+    private static final String PREF_ACTIVE_ALERTS_KEY = "active_alert_notification_ids";
+
+    /** Active (pinned) alert ids, persisted so stop-all works across processes. */
+    private static Set<Integer> persistedActiveAlerts(Context context) {
+        Set<Integer> ids = new HashSet<>();
+        String raw = FloatingClockStyle.preferences(context)
+            .getString(PREF_ACTIVE_ALERTS_KEY, "");
+        if (raw == null || raw.isEmpty()) return ids;
+        for (String part : raw.split(",")) {
+            try {
+                ids.add(Integer.parseInt(part.trim()));
+            } catch (NumberFormatException ignored) {
+                // Ignore one bad entry in the persisted id list.
+            }
+        }
+        return ids;
+    }
+
+    private static void writePersistedActiveAlerts(Context context, Set<Integer> ids) {
+        StringBuilder raw = new StringBuilder();
+        for (int id : ids) {
+            if (raw.length() > 0) raw.append(',');
+            raw.append(id);
+        }
+        // commit(): the record must be on disk before this process can be killed.
+        FloatingClockStyle.preferences(context).edit()
+            .putString(PREF_ACTIVE_ALERTS_KEY, raw.toString()).commit();
+    }
+
+    private static void addActiveAlert(Context context, int notificationId) {
+        ACTIVE_ALERT_NOTIFICATIONS.add(notificationId);
+        Set<Integer> ids = persistedActiveAlerts(context);
+        if (ids.add(notificationId)) writePersistedActiveAlerts(context, ids);
+    }
+
+    private static void removeActiveAlert(Context context, int notificationId) {
+        ACTIVE_ALERT_NOTIFICATIONS.remove(notificationId);
+        Set<Integer> ids = persistedActiveAlerts(context);
+        if (ids.remove(notificationId)) writePersistedActiveAlerts(context, ids);
+    }
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -100,6 +140,12 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
             ? new Notification.Builder(context, FloatingEventStore.NOTIFICATION_CHANNEL_ID)
             : new Notification.Builder(context);
+        if (Build.VERSION.SDK_INT >= 26) {
+            // System-side timeout: the pinned alert becomes dismissible even if
+            // this process is killed before the in-memory soften task runs.
+            // SOFTEN_HANDLER below is kept only as a fallback.
+            builder.setTimeoutAfter(alarmMode ? MAX_ALARM_RING_MILLIS : MAX_NOTIFICATION_RING_MILLIS);
+        }
         Notification notification = builder
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle(title)
@@ -113,7 +159,7 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
             .addAction(new Notification.Action.Builder(android.R.drawable.ic_media_pause,
                 "停止提醒", stopIntent).build())
             .build();
-        ACTIVE_ALERT_NOTIFICATIONS.add(notificationId);
+        addActiveAlert(context, notificationId);
         manager.notify(notificationId, notification);
         scheduleSoften(context, notificationId, title, text, contentIntent,
             alarmMode ? MAX_ALARM_RING_MILLIS : MAX_NOTIFICATION_RING_MILLIS);
@@ -147,6 +193,8 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
                     "停止提醒", stopIntent(appContext, notificationId)).build())
                 .build();
             manager.notify(notificationId, softened);
+            // The alert is dismissible now; it no longer needs the pinned record.
+            removeActiveAlert(appContext, notificationId);
         }, afterMillis);
     }
 
@@ -206,6 +254,10 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
             ? new Notification.Builder(context, FloatingEventStore.NOTIFICATION_CHANNEL_ID)
             : new Notification.Builder(context);
+        if (Build.VERSION.SDK_INT >= 26) {
+            // System-side timeout; the in-memory soften task is only a fallback.
+            builder.setTimeoutAfter(MAX_ALARM_RING_MILLIS);
+        }
         Notification notification = builder
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle("测试闹钟已触发")
@@ -218,7 +270,7 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
             .addAction(new Notification.Action.Builder(android.R.drawable.ic_media_pause,
                 "停止提醒", stopIntent(context, notificationId)).build())
             .build();
-        ACTIVE_ALERT_NOTIFICATIONS.add(notificationId);
+        addActiveAlert(context, notificationId);
         manager.notify(notificationId, notification);
         scheduleSoften(context, notificationId, "测试闹钟已触发",
             "如果听到闹铃并感到振动，事件闹钟链路正常。", contentIntent, MAX_ALARM_RING_MILLIS);
@@ -235,9 +287,9 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
     }
 
     private static void stopActiveAlert(Context context, int notificationId) {
+        removeActiveAlert(context, notificationId);
         boolean moreAlertsRemain;
         synchronized (ACTIVE_ALERT_NOTIFICATIONS) {
-            ACTIVE_ALERT_NOTIFICATIONS.remove(notificationId);
             moreAlertsRemain = !ACTIVE_ALERT_NOTIFICATIONS.isEmpty();
         }
         // Ringtone and vibrator are shared; only silence them when no other alert is active.
@@ -251,8 +303,8 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
         stopPlayback();
         int dueId = (eventId + "due").hashCode();
         int reminderId = (eventId + "reminder").hashCode();
-        ACTIVE_ALERT_NOTIFICATIONS.remove(dueId);
-        ACTIVE_ALERT_NOTIFICATIONS.remove(reminderId);
+        removeActiveAlert(context, dueId);
+        removeActiveAlert(context, reminderId);
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         if (manager != null) {
             manager.cancel(dueId);
@@ -267,6 +319,9 @@ public final class FloatingEventAlarmReceiver extends BroadcastReceiver {
             ids.addAll(ACTIVE_ALERT_NOTIFICATIONS);
             ACTIVE_ALERT_NOTIFICATIONS.clear();
         }
+        // Include ids persisted by a previous process that has since died.
+        ids.addAll(persistedActiveAlerts(context));
+        writePersistedActiveAlerts(context, new HashSet<>());
         ids.add(TEST_NOTIFICATION_ID + 1);
         for (FloatingEventStore.Event event : FloatingEventStore.load(context)) {
             ids.add((event.id + "due").hashCode());

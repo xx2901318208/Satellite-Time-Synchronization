@@ -5,10 +5,12 @@ import android.os.SystemClock;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -24,9 +26,18 @@ final class NitzSampleMonitor {
     private static final long FUTURE_TOLERANCE_MILLIS = 2_000;
     private static final long MIN_EPOCH_MILLIS = 1_577_836_800_000L; // 2020-01-01 UTC
     private static final long MAX_EPOCH_MILLIS = 4_102_444_800_000L; // 2100-01-01 UTC
-    private static final long MAX_REGRESSION_STEP_ERROR_MILLIS = 120_000;
+    // A carrier clock may legitimately be corrected, but a genuine correction is a
+    // discontinuity, not a 2-minute step: anything over 5 s is rebased, not regressed.
+    private static final long MAX_REGRESSION_STEP_ERROR_MILLIS = 5_000;
     private static final long MIN_DRIFT_SPAN_MILLIS = 10L * 60 * 1000;
     private static final int MAX_HISTORY_SIZE = 64;
+    // Normal per-sample summaries are throttled: the caller logs every return value,
+    // so a full summary is emitted at most once per minute per slot. Abnormal samples
+    // (ignored / filtered / rebased) are always reported in full immediately.
+    private static final long FULL_LOG_MIN_INTERVAL_MILLIS = 60_000L;
+    // Reflective Method lookups are cached per Class + method name; suggestTelephonyTime
+    // is a system_server hot path and must not pay getMethod() on every suggestion.
+    private static final Map<String, Method> METHOD_CACHE = new ConcurrentHashMap<>();
 
     private final Map<Integer, SlotState> states = new HashMap<>();
 
@@ -58,11 +69,33 @@ final class NitzSampleMonitor {
         if (state.lastSeen != null
                 && state.lastSeen.elapsedRealtimeMillis == sampleElapsed
                 && state.lastSeen.unixEpochTimeMillis == sampleUnix) {
-            return summary(slotIndex, sample, ageMillis, predictedNow, state, "duplicate");
+            return throttledSummary(slotIndex, sample, ageMillis, predictedNow, state,
+                "duplicate");
         }
 
         String status = acceptForDiagnostics(state, sample);
         state.lastSeen = sample;
+        return throttledSummary(slotIndex, sample, ageMillis, predictedNow, state, status);
+    }
+
+    /**
+     * Returns the full diagnostic summary, unless this is a routine sample and a full
+     * summary was already emitted for this slot within the last minute. In that case a
+     * one-line digest is returned instead, so the Xposed log is not flooded by every
+     * NITZ suggestion while abnormal samples still surface immediately.
+     */
+    private static String throttledSummary(int slotIndex, Sample sample, long ageMillis,
+            long predictedNow, SlotState state, String status) {
+        boolean abnormal = status.startsWith("filtered_")
+            || status.startsWith("accepted_rebased_");
+        long nowElapsed = SystemClock.elapsedRealtime();
+        if (!abnormal && state.lastFullLogElapsedMillis >= 0
+                && nowElapsed - state.lastFullLogElapsedMillis < FULL_LOG_MIN_INTERVAL_MILLIS) {
+            return "slot=" + slotIndex + " sample=" + status + " (summary throttled, next full"
+                + " summary within 60s) ageMs=" + ageMillis
+                + " interpolatedNowUnixMs=" + predictedNow;
+        }
+        state.lastFullLogElapsedMillis = nowElapsed;
         return summary(slotIndex, sample, ageMillis, predictedNow, state, status);
     }
 
@@ -148,6 +181,34 @@ final class NitzSampleMonitor {
         long span = last.elapsedRealtimeMillis - first.elapsedRealtimeMillis;
         if (span < MIN_DRIFT_SPAN_MILLIS) return null;
 
+        // Robust pre-filter: a single bad NITZ point must not bend the OLS fit. For a
+        // perfect clock, (unix - elapsed) is constant, so work on the residuals of that
+        // quantity around its median and drop points beyond 3 robust sigmas (MAD). The
+        // 1 s floor keeps the filter from discarding everything when MAD is 0, which
+        // is the normal case for whole-second NITZ timestamps.
+        List<Long> residuals = new ArrayList<>(samples.size());
+        for (Sample sample : samples) {
+            residuals.add((sample.unixEpochTimeMillis - sample.elapsedRealtimeMillis)
+                - (first.unixEpochTimeMillis - first.elapsedRealtimeMillis));
+        }
+        long medianResidual = medianLong(residuals);
+        List<Long> deviations = new ArrayList<>(residuals.size());
+        for (long residual : residuals) deviations.add(Math.abs(residual - medianResidual));
+        long mad = medianLong(deviations);
+        long rejectThreshold = Math.max(1_000L, (long) (3 * 1.4826 * mad));
+        List<Sample> kept = new ArrayList<>(samples.size());
+        for (int i = 0; i < samples.size(); i++) {
+            if (Math.abs(residuals.get(i) - medianResidual) <= rejectThreshold) {
+                kept.add(samples.get(i));
+            }
+        }
+        if (kept.size() < 3) return null;
+        samples = kept;
+        first = samples.get(0);
+        last = samples.get(samples.size() - 1);
+        span = last.elapsedRealtimeMillis - first.elapsedRealtimeMillis;
+        if (span < MIN_DRIFT_SPAN_MILLIS) return null;
+
         double meanX = 0;
         double meanY = 0;
         for (Sample sample : samples) {
@@ -175,6 +236,14 @@ final class NitzSampleMonitor {
         return new Drift(ppm, quantizationPpm, span);
     }
 
+    private static long medianLong(List<Long> values) {
+        List<Long> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+        int middle = sorted.size() / 2;
+        if (sorted.size() % 2 == 1) return sorted.get(middle);
+        return (sorted.get(middle - 1) + sorted.get(middle)) / 2;
+    }
+
     private static int readInt(Object target, String methodName) throws Exception {
         Object value = invoke(target, methodName);
         if (!(value instanceof Number)) throw new IllegalStateException(methodName + " not numeric");
@@ -188,7 +257,12 @@ final class NitzSampleMonitor {
     }
 
     private static Object invoke(Object target, String methodName) throws Exception {
-        Method method = target.getClass().getMethod(methodName);
+        String key = target.getClass().getName() + "#" + methodName;
+        Method method = METHOD_CACHE.get(key);
+        if (method == null) {
+            method = target.getClass().getMethod(methodName);
+            METHOD_CACHE.put(key, method);
+        }
         return method.invoke(target);
     }
 
@@ -197,6 +271,7 @@ final class NitzSampleMonitor {
         Sample lastAccepted;
         Sample lastSeen;
         long lastStepErrorMillis;
+        long lastFullLogElapsedMillis = -1L;
         int acceptedCount;
         int discontinuities;
         int rejectedNonMonotonic;

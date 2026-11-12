@@ -53,10 +53,12 @@ public final class FloatingClockService extends Service {
             if (checkOverlayPermission) {
                 lastOverlayPermissionCheckElapsed = elapsedNow;
                 if (!Settings.canDrawOverlays(FloatingClockService.this)) {
+                    // Keep KEY_ENABLED: losing the permission is not the user
+                    // turning the clock off; it restarts once permission returns.
                     FloatingClockStyle.preferences(FloatingClockService.this).edit()
-                        .putBoolean(FloatingClockStyle.KEY_ENABLED, false)
                         .putBoolean(FloatingClockStyle.KEY_RUNNING, false)
-                        .putString(FloatingClockStyle.KEY_LAST_ERROR, "悬浮窗权限已关闭")
+                        .putString(FloatingClockStyle.KEY_LAST_ERROR,
+                            "悬浮窗权限已关闭；重新授权后回到悬浮时间设置页可自动恢复")
                         .apply();
                     stopSelf();
                     return;
@@ -91,8 +93,8 @@ public final class FloatingClockService extends Service {
             return START_NOT_STICKY;
         }
         if (windowManager == null || !Settings.canDrawOverlays(this)) {
+            // Keep KEY_ENABLED (user intent); only record that it is not running.
             FloatingClockStyle.preferences(this).edit()
-                .putBoolean(FloatingClockStyle.KEY_ENABLED, false)
                 .putBoolean(FloatingClockStyle.KEY_RUNNING, false)
                 .putString(FloatingClockStyle.KEY_LAST_ERROR, "请先授予悬浮窗权限")
                 .apply();
@@ -117,8 +119,8 @@ public final class FloatingClockService extends Service {
             handler.post(ticker);
             return START_STICKY;
         } catch (RuntimeException exception) {
+            // Keep KEY_ENABLED: a start failure is not the user turning it off.
             FloatingClockStyle.preferences(this).edit()
-                .putBoolean(FloatingClockStyle.KEY_ENABLED, false)
                 .putBoolean(FloatingClockStyle.KEY_RUNNING, false)
                 .putString(FloatingClockStyle.KEY_LAST_ERROR,
                     "悬浮窗启动失败：" + exception.getClass().getSimpleName())

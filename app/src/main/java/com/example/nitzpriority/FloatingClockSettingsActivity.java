@@ -69,6 +69,10 @@ public final class FloatingClockSettingsActivity extends Activity {
             0xFF58718A, false);
         intro.setPadding(0, dp(5), 0, dp(14));
         page.addView(intro, matchWrap());
+        TextView rebootHint = text("提示：重启设备后悬浮时钟不会自动启动，点按开机后弹出的恢复通知，或回到本页即可自动恢复。", 13,
+            0xFF69849A, false);
+        rebootHint.setPadding(0, 0, 0, dp(4));
+        page.addView(rebootHint, matchWrap());
 
         LinearLayout permissionCard = card();
         page.addView(permissionCard, marginMatch(dp(4), dp(8)));
@@ -252,10 +256,15 @@ public final class FloatingClockSettingsActivity extends Activity {
         boolean enabled = FloatingClockStyle.preferences(this)
             .getBoolean(FloatingClockStyle.KEY_ENABLED, false);
         if (enabled && !granted) {
-            FloatingClockStyle.preferences(this).edit()
-                .putBoolean(FloatingClockStyle.KEY_ENABLED, false).apply();
+            // Keep KEY_ENABLED: losing the permission is not the user turning
+            // the clock off. Stop the service; it restarts once permission returns.
             stopService(new Intent(this, FloatingClockService.class));
-            enabled = false;
+        } else if (enabled && granted) {
+            // Self-heal after reboot / process death / service crash: restart
+            // when the user still wants the clock but it is not running.
+            boolean running = FloatingClockStyle.preferences(this)
+                .getBoolean(FloatingClockStyle.KEY_RUNNING, false);
+            if (!running) startOverlayService();
         }
         setSwitchChecked(enabled);
     }
@@ -287,11 +296,12 @@ public final class FloatingClockSettingsActivity extends Activity {
             else startService(intent);
             Toast.makeText(this, "悬浮时钟已开启，可在其他应用上层查看。", Toast.LENGTH_SHORT).show();
         } catch (RuntimeException exception) {
+            // Keep KEY_ENABLED and the switch state: a start failure is not
+            // the user turning the clock off; onResume will retry.
             FloatingClockStyle.preferences(this).edit()
-                .putBoolean(FloatingClockStyle.KEY_ENABLED, false)
+                .putBoolean(FloatingClockStyle.KEY_RUNNING, false)
                 .putString(FloatingClockStyle.KEY_LAST_ERROR,
                     "启动服务失败：" + exception.getClass().getSimpleName()).apply();
-            setSwitchChecked(false);
             Toast.makeText(this, "启动失败，请检查通知和悬浮窗权限。", Toast.LENGTH_LONG).show();
         }
     }

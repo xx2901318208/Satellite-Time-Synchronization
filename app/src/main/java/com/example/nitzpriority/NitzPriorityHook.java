@@ -1,5 +1,7 @@
 package com.example.nitzpriority;
 
+import android.os.SystemClock;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -16,11 +18,16 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
     private static final int ORIGIN_TELEPHONY = 1;
     private static final int ORIGIN_NETWORK = 3;
     private static final int ORIGIN_GNSS = 4;
-    static final int AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS = 100;
+    static final int AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS = 1000;
     static final String THRESHOLD_STATUS_PROPERTY = "debug.nitz.clock_threshold";
     static final String THRESHOLD_CONFIG_PROPERTY = "debug.nitz.clock_threshold_config";
-    static final int MIN_CLOCK_UPDATE_THRESHOLD_MILLIS = 1;
+    static final int MIN_CLOCK_UPDATE_THRESHOLD_MILLIS = 100;
     static final int MAX_CLOCK_UPDATE_THRESHOLD_MILLIS = 2_000;
+    // A GNSS-first ordering is only valid while GNSS suggestions are actually arriving.
+    // 10 minutes matches the diagnostics page's "recent GNSS sample" window.
+    private static final long GNSS_SUGGESTION_MAX_AGE_MILLIS = 10L * 60 * 1000;
+    private static volatile long lastGnssSuggestionElapsedMillis = -1;
+    private static volatile boolean gnssStaleFallbackLogged;
 
     private final NitzSampleMonitor sampleMonitor = new NitzSampleMonitor();
     private final GnssTriggerBridge gnssTriggerBridge = new GnssTriggerBridge();
@@ -308,6 +315,7 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                             ? param.args[0] : null;
                         XposedBridge.log(TAG + ": GNSS time suggestion reached time_detector: "
                             + String.valueOf(suggestion));
+                        recordGnssSuggestionElapsed(suggestion);
                     }
                 }
             );
@@ -317,6 +325,41 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
         }
     }
 
+    // Records when the latest GNSS suggestion was taken, from its UnixEpochTime. Only a
+    // monotonically newer timestamp advances the marker, so a re-delivered old suggestion
+    // cannot extend freshness. Any reflection failure is diagnostic-only and must never
+    // interfere with system_server time detection.
+    private static void recordGnssSuggestionElapsed(Object suggestion) {
+        if (suggestion == null) return;
+        try {
+            Object unixEpochTime = suggestion.getClass().getMethod("getUnixEpochTime")
+                .invoke(suggestion);
+            if (unixEpochTime == null) return;
+            Object elapsed = unixEpochTime.getClass().getMethod("getElapsedRealtimeMillis")
+                .invoke(unixEpochTime);
+            if (!(elapsed instanceof Number)) return;
+            long sampleElapsed = ((Number) elapsed).longValue();
+            long nowElapsed = SystemClock.elapsedRealtime();
+            // Reject non-positive or implausibly future timestamps (2s tolerance for
+            // cross-thread sampling skew); elapsedRealtime is monotonic, so a value far
+            // in the future cannot be a genuine sample.
+            if (sampleElapsed <= 0 || sampleElapsed > nowElapsed + 2_000) return;
+            if (sampleElapsed > lastGnssSuggestionElapsedMillis) {
+                lastGnssSuggestionElapsedMillis = sampleElapsed;
+                gnssStaleFallbackLogged = false;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": could not read GNSS suggestion elapsed time: " + t);
+        }
+    }
+
+    private static boolean isGnssSuggestionFresh() {
+        long last = lastGnssSuggestionElapsedMillis;
+        if (last < 0) return false;
+        long age = SystemClock.elapsedRealtime() - last;
+        return age >= 0 && age < GNSS_SUGGESTION_MAX_AGE_MILLIS;
+    }
+
     private Class<?> findClass(String name, XC_LoadPackage.LoadPackageParam p)
             throws ClassNotFoundException {
         return Class.forName(name, false, p.classLoader);
@@ -324,7 +367,25 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
 
     private static int[] prioritized(int[] original, boolean gnssEnabled) {
         if (original == null || original.length == 0) return original;
-        return gnssEnabled ? gnssThenTelephony(original) : telephonyFirst(original);
+        if (!gnssEnabled) {
+            // GNSS service unavailable: respect the AOSP default ordering (network before
+            // telephony) instead of forcing NITZ ahead of NTP. P0-3: the old telephonyFirst()
+            // rewrite is removed; no reordering happens on this path.
+            return original;
+        }
+        if (!isGnssSuggestionFresh()) {
+            // GNSS enabled but no fresh suggestion within 10 minutes: fall back to the AOSP
+            // default ordering instead of advertising a stale GNSS-first priority. Log once
+            // per stale episode; the flag resets when a newer suggestion arrives.
+            if (!gnssStaleFallbackLogged) {
+                gnssStaleFallbackLogged = true;
+                XposedBridge.log(TAG + ": gnss_stale_fallback: no fresh GNSS suggestion within "
+                    + (GNSS_SUGGESTION_MAX_AGE_MILLIS / 60_000)
+                    + " min; keeping AOSP default origin priorities " + format(original));
+            }
+            return original;
+        }
+        return gnssThenTelephony(original);
     }
 
     private static int[] gnssThenTelephony(int[] original) {
@@ -350,30 +411,6 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
         int[] adjusted = toArray(result);
         if (same(original, adjusted)) return original;
         XposedBridge.log(TAG + ": GNSS-first origin priorities " + format(original)
-            + " -> " + format(adjusted));
-        return adjusted;
-    }
-
-    private static int[] telephonyFirst(int[] original) {
-        if (original == null || original.length < 2) return original;
-
-        int telephonyIndex = -1;
-        int networkIndex = -1;
-        for (int i = 0; i < original.length; i++) {
-            if (original[i] == ORIGIN_TELEPHONY && telephonyIndex < 0) telephonyIndex = i;
-            if (original[i] == ORIGIN_NETWORK && networkIndex < 0) networkIndex = i;
-        }
-        if (telephonyIndex < 0 || networkIndex < 0 || telephonyIndex < networkIndex) {
-            return original;
-        }
-
-        // Move only the first telephony entry immediately before network. This preserves every
-        // element, including duplicate origins, and keeps other entries' relative order.
-        int[] adjusted = original.clone();
-        System.arraycopy(adjusted, networkIndex, adjusted, networkIndex + 1,
-            telephonyIndex - networkIndex);
-        adjusted[networkIndex] = ORIGIN_TELEPHONY;
-        XposedBridge.log(TAG + ": telephony-first origin priorities " + format(original)
             + " -> " + format(adjusted));
         return adjusted;
     }

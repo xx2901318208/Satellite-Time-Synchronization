@@ -19,6 +19,8 @@ import java.util.TimeZone;
 /** Local event storage and notification alarm scheduling for the floating clock. */
 final class FloatingEventStore {
     static final String EVENTS_KEY = "floating_events_json";
+    static final String EVENTS_BACKUP_KEY = "floating_events_json.bak";
+    static final int MAX_EVENTS = 200;
     static final String DEFAULT_REMINDER_KEY = "default_reminder_minutes";
     static final String ALERT_SOUND_ENABLED_KEY = "event_alert_sound_enabled";
     static final String ALERT_VIBRATION_ENABLED_KEY = "event_alert_vibration_enabled";
@@ -43,41 +45,89 @@ final class FloatingEventStore {
 
     private FloatingEventStore() { }
 
-    static List<Event> load(Context context) {
-        List<Event> events = new ArrayList<>();
-        String encoded = FloatingClockStyle.preferences(context).getString(EVENTS_KEY, "[]");
+    /**
+     * Parses stored event JSON. Returns null when the top-level JSON is
+     * unreadable; a single bad entry is skipped instead of dropping the table.
+     * At most {@link #MAX_EVENTS} events are kept.
+     */
+    private static List<Event> parseEvents(String encoded) {
+        if (encoded == null) return null;
         try {
             JSONArray array = new JSONArray(encoded);
-            for (int i = 0; i < array.length(); i++) {
-                JSONObject object = array.optJSONObject(i);
-                if (object == null) continue;
-                String id = object.optString("id", "");
-                String title = object.optString("title", "").trim();
-                long target = object.optLong("target", 0L);
-                String url = object.optString("url", "").trim();
-                int reminder = Math.max(0, Math.min(1440, object.optInt("reminder", 0)));
-                if (!id.isEmpty() && !title.isEmpty() && target > 0) {
-                    events.add(new Event(id, title, target, url, reminder));
+            List<Event> events = new ArrayList<>();
+            for (int i = 0; i < array.length() && events.size() < MAX_EVENTS; i++) {
+                try {
+                    JSONObject object = array.optJSONObject(i);
+                    if (object == null) continue;
+                    String id = object.optString("id", "");
+                    String title = object.optString("title", "").trim();
+                    long target = object.optLong("target", 0L);
+                    String url = object.optString("url", "").trim();
+                    int reminder = Math.max(0, Math.min(1440, object.optInt("reminder", 0)));
+                    if (!id.isEmpty() && !title.isEmpty() && target > 0) {
+                        events.add(new Event(id, title, target, url, reminder));
+                    }
+                } catch (Exception ignored) {
+                    // Skip one bad entry rather than losing the whole table.
                 }
             }
+            return events;
         } catch (Exception ignored) {
-            // A malformed local preference should not prevent the app from opening.
+            return null;
         }
-        return events;
+    }
+
+    /** True when the stored primary JSON cannot be parsed at all. */
+    static boolean isEventsCorrupt(Context context) {
+        return parseEvents(
+            FloatingClockStyle.preferences(context).getString(EVENTS_KEY, "[]")) == null;
+    }
+
+    /**
+     * Loads events. Returns null only when BOTH the primary JSON and the
+     * backup are unreadable; callers must not treat null as "no events",
+     * otherwise a later save() would permanently overwrite stored data with
+     * an empty table. A corrupt primary is repaired from the backup when
+     * the backup still parses.
+     */
+    static List<Event> load(Context context) {
+        android.content.SharedPreferences prefs = FloatingClockStyle.preferences(context);
+        List<Event> events = parseEvents(prefs.getString(EVENTS_KEY, "[]"));
+        if (events != null) return events;
+        String backup = prefs.getString(EVENTS_BACKUP_KEY, null);
+        List<Event> restored = parseEvents(backup);
+        if (restored == null) return null;
+        // Repair the primary copy from the backup so the next load is direct.
+        prefs.edit().putString(EVENTS_KEY, backup).apply();
+        return restored;
     }
 
     static Event find(Context context, String id) {
         if (id == null || id.isEmpty()) return null;
-        for (Event event : load(context)) {
+        List<Event> events = load(context);
+        if (events == null) return null;
+        for (Event event : events) {
             if (id.equals(event.id)) return event;
         }
         return null;
     }
 
     static void save(Context context, List<Event> events) {
-        for (Event oldEvent : load(context)) cancelAll(context, oldEvent);
+        // Never let a failed load turn into an empty overwrite: if both the
+        // primary JSON and the backup are unreadable, refuse to save.
+        List<Event> oldEvents = load(context);
+        if (oldEvents == null) return;
+        for (Event oldEvent : oldEvents) cancelAll(context, oldEvent);
+        // Back up the current raw JSON (one generation) before overwriting it.
+        android.content.SharedPreferences prefs = FloatingClockStyle.preferences(context);
+        String currentRaw = prefs.getString(EVENTS_KEY, null);
+        if (currentRaw != null && parseEvents(currentRaw) != null) {
+            prefs.edit().putString(EVENTS_BACKUP_KEY, currentRaw).apply();
+        }
         JSONArray array = new JSONArray();
+        int kept = 0;
         for (Event event : events) {
+            if (kept >= MAX_EVENTS) break;
             JSONObject object = new JSONObject();
             try {
                 object.put("id", event.id);
@@ -86,17 +136,38 @@ final class FloatingEventStore {
                 object.put("url", event.url);
                 object.put("reminder", event.reminderMinutes);
                 array.put(object);
+                kept++;
             } catch (Exception ignored) {
                 // Skip a single bad event rather than losing other local events.
             }
         }
-        FloatingClockStyle.preferences(context).edit()
+        prefs.edit()
             .putString(EVENTS_KEY, array.toString()).apply();
         rescheduleAll(context);
     }
 
     static void rescheduleAll(Context context) {
+        boolean corrupt = isEventsCorrupt(context);
         List<Event> events = load(context);
+        if (events == null) {
+            // Primary and backup are both unreadable: do nothing rather than
+            // cancelling alarms or overwriting data.
+            try {
+                android.widget.Toast.makeText(context, "事件数据已损坏且备份无法恢复，请重新创建事件。",
+                    android.widget.Toast.LENGTH_LONG).show();
+            } catch (RuntimeException ignored) {
+                // Toast must not break boot restore.
+            }
+            return;
+        }
+        if (corrupt) {
+            try {
+                android.widget.Toast.makeText(context, "事件数据已损坏，已从备份恢复。",
+                    android.widget.Toast.LENGTH_LONG).show();
+            } catch (RuntimeException ignored) {
+                // Toast must not break boot restore.
+            }
+        }
         long now = System.currentTimeMillis();
         for (Event event : events) {
             cancelAll(context, event);

@@ -43,6 +43,7 @@ public final class GnssLocationTrackingService extends Service {
     private String sessionToken = "";
     private int fixCount;
     private int rawMeasurementCount;
+    private int lastDiscontinuityCount = -1;
     private boolean tracking;
     private final Runnable timeoutRunnable = () -> stopTracking("TIMED_OUT");
 
@@ -265,19 +266,41 @@ public final class GnssLocationTrackingService extends Service {
                     ? clock.getElapsedRealtimeNanos() : -1L;
                 long ageNanos = clockElapsedNanos >= 0
                     ? callbackElapsedNanos - clockElapsedNanos : Long.MAX_VALUE;
+                // Freshness window is 1 s, not 10 s: a 10 s old GnssClock paired with the
+                // current wall clock can be off by seconds (receiver drift + scheduling).
                 boolean clockFresh = clockElapsedNanos >= 0
-                    && ageNanos >= -100_000_000L && ageNanos <= 10_000_000_000L;
+                    && ageNanos >= -100_000_000L && ageNanos <= 1_000_000_000L;
 
                 boolean hasFullBias = clock.hasFullBiasNanos();
                 boolean hasBias = clock.hasBiasNanos();
                 boolean hasLeapSecond = clock.hasLeapSecond();
                 double biasNanos = hasBias ? clock.getBiasNanos() : 0.0;
-                double gpsTimeNanos = hasFullBias
-                    ? (double) clock.getTimeNanos()
-                        - ((double) clock.getFullBiasNanos() + biasNanos)
-                    : Double.NaN;
+                int leapSecond = hasLeapSecond ? clock.getLeapSecond() : -1;
+                // GPS-UTC is currently 18 s; anything outside 10-30 s means the HAL
+                // returned an uninitialised or bogus leap second (0 would shift UTC
+                // by 18 s with no warning).
+                boolean leapValid = leapSecond >= 10 && leapSecond <= 30;
+                int discontinuityCount = clock.getHardwareClockDiscontinuityCount();
+                boolean discontinuityChanged = lastDiscontinuityCount >= 0
+                    && discontinuityCount != lastDiscontinuityCount;
+                lastDiscontinuityCount = discontinuityCount;
+                // A reported time uncertainty over 100 ms makes the sample diagnostic
+                // only; it must not feed a millisecond offset display.
+                boolean uncertaintyOk = !clock.hasTimeUncertaintyNanos()
+                    || clock.getTimeUncertaintyNanos() < 100_000_000.0;
+                // GPS time in long nanos: double loses integer precision above 2^53
+                // (~1.4e18 ns here is ~256 ns steps) and must not carry the conversion.
+                long gpsTimeNanos = hasFullBias
+                    ? clock.getTimeNanos() - clock.getFullBiasNanos() - (long) biasNanos
+                    : 0L;
 
-                boolean utcAvailable = hasFullBias && hasLeapSecond && clockFresh;
+                String discardReason = "";
+                if (!clockFresh) discardReason = "stale_clock_over_1s";
+                else if (!leapValid) discardReason = "leap_second_out_of_range";
+                else if (discontinuityChanged) discardReason = "clock_discontinuity_changed";
+                else if (!uncertaintyOk) discardReason = "time_uncertainty_over_100ms";
+                boolean utcAvailable = hasFullBias && hasLeapSecond && clockFresh
+                    && leapValid && !discontinuityChanged && uncertaintyOk;
                 long gnssUtcMillis = 0L;
                 double phoneUtcAtSampleMillis = Double.NaN;
                 double offsetMillis = Double.NaN;
@@ -290,13 +313,22 @@ public final class GnssLocationTrackingService extends Service {
                     + (wallPairElapsedAfter - wallPairElapsedBefore) / 2L;
                 wallPairMillis = wallMillis;
                 if (utcAvailable) {
-                    long gpsSinceEpochMillis = Math.round(gpsTimeNanos / 1_000_000.0);
+                    long gpsSinceEpochMillis = gpsTimeNanos / 1_000_000L;
                     gnssUtcMillis = 315_964_800_000L + gpsSinceEpochMillis
-                        - clock.getLeapSecond() * 1_000L;
+                        - (long) leapSecond * 1_000L;
                     phoneUtcAtSampleMillis = wallPairMillis
                         + (clockElapsedNanos - wallPairElapsedNanos) / 1_000_000.0;
                     offsetMillis = gnssUtcMillis - phoneUtcAtSampleMillis;
+                    // A GPS week rollover or uninitialised receiver clock can produce a
+                    // wildly wrong offset; never display it as a real millisecond value.
+                    if (Math.abs(offsetMillis) > 60_000.0) {
+                        discardReason = "offset_over_60s";
+                        utcAvailable = false;
+                        gnssUtcMillis = 0L;
+                        offsetMillis = Double.NaN;
+                    }
                 }
+                boolean sampleDiscarded = !discardReason.isEmpty();
 
                 android.content.SharedPreferences.Editor editor =
                     getSharedPreferences(PREFS, MODE_PRIVATE).edit()
@@ -315,8 +347,13 @@ public final class GnssLocationTrackingService extends Service {
                         .putLong("raw_time_nanos", clock.getTimeNanos())
                         .putLong("raw_full_bias_nanos", hasFullBias ? clock.getFullBiasNanos() : 0L)
                         .putString("raw_bias_nanos", Double.toString(biasNanos))
-                        .putInt("raw_leap_second", hasLeapSecond ? clock.getLeapSecond() : -1)
-                        .putString("raw_gps_time_nanos", Double.toString(gpsTimeNanos))
+                        .putInt("raw_leap_second", leapSecond)
+                        .putBoolean("raw_leap_second_valid", leapValid)
+                        .putBoolean("raw_sample_discarded", sampleDiscarded)
+                        .putString("raw_discard_reason", discardReason)
+                        .putBoolean("raw_discontinuity_changed", discontinuityChanged)
+                        .putString("raw_gps_time_nanos",
+                            hasFullBias ? Long.toString(gpsTimeNanos) : "NaN")
                         .putLong("raw_gnss_utc_millis", gnssUtcMillis)
                         .putString("raw_phone_utc_at_sample_millis",
                             Double.toString(phoneUtcAtSampleMillis))
