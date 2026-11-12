@@ -43,6 +43,7 @@ public final class TimeDiagnosticsActivity extends Activity {
     private static final String GNSS_MARKER = "__NITZPRIORITY_GNSS__";
     private static final String THRESHOLD_MARKER = "__NITZPRIORITY_THRESHOLD__";
     private static final String THRESHOLD_CONFIG_MARKER = "__NITZPRIORITY_THRESHOLD_CONFIG__";
+    private static final String CALIBRATION_MARKER = "__NITZPRIORITY_CALIBRATION__";
     // Force-jump sources must all be fresh: GNSS, NITZ and NTP alike (was 24 h for
     // NITZ/NTP). NTP_REFERENCE_MAX_AGE_MILLIS below is display-only and unchanged.
     private static final long MAX_FORCE_SAMPLE_AGE_MILLIS = 600_000L;
@@ -62,7 +63,11 @@ public final class TimeDiagnosticsActivity extends Activity {
     // drifts with the phone crystal (100 ppm budget, ~4.3 s over 24 h at 50 ppm).
     // Displayed values are therefore always "difference +/- uncertainty".
     private static final long DRIFT_BUDGET_PPM = 100L;
+    // Calibrated NITZ starts at +/-200 ms instead of the raw +/-1500 ms: the
+    // learned per-carrier bias removes the fixed part of the error, but
+    // delivery jitter and staleness remain, so it never drops to 10 ms.
     private static final long NITZ_BASE_UNCERTAINTY_MILLIS = 1_500L;
+    private static final long NITZ_CALIBRATED_BASE_UNCERTAINTY_MILLIS = 200L;
     private static final long GNSS_BASE_UNCERTAINTY_MILLIS = 500L;
     private static final long NETWORK_UNKNOWN_UNCERTAINTY_MILLIS = 1_000L;
     // Display-only staleness bands. These do NOT change force-jump age limits.
@@ -455,7 +460,9 @@ public final class TimeDiagnosticsActivity extends Activity {
                 + THRESHOLD_MARKER + "; getprop "
                 + NitzPriorityHook.THRESHOLD_STATUS_PROPERTY + "; echo "
                 + THRESHOLD_CONFIG_MARKER + "; getprop "
-                + NitzPriorityHook.THRESHOLD_CONFIG_PROPERTY;
+                + NitzPriorityHook.THRESHOLD_CONFIG_PROPERTY + "; echo "
+                + CALIBRATION_MARKER + "; getprop "
+                + NitzCalibrator.CALIBRATION_STATUS_PROPERTY;
             RootCommand.Result result = RootCommand.run(command);
             String[] parts = result.output.split(Pattern.quote(TIME_MARKER), 2);
             String identity = parts.length > 0 ? parts[0] : "";
@@ -469,7 +476,13 @@ public final class TimeDiagnosticsActivity extends Activity {
                 ? thresholdParts[1].split(Pattern.quote(THRESHOLD_CONFIG_MARKER), 2)
                 : new String[0];
             String thresholdStatus = configParts.length > 0 ? configParts[0].trim() : "";
-            String thresholdConfig = configParts.length > 1 ? configParts[1].trim() : "";
+            String[] calibrationParts = configParts.length > 1
+                ? configParts[1].split(Pattern.quote(CALIBRATION_MARKER), 2)
+                : new String[0];
+            String thresholdConfig = calibrationParts.length > 0
+                ? calibrationParts[0].trim() : "";
+            String nitzCalibrationStatus = calibrationParts.length > 1
+                ? calibrationParts[1].trim() : "";
             boolean hasRoot = result.exitCode == 0 && identity.contains("uid=0");
             recordGnssTrendPoint(timeDump);
             long trendNowElapsed = parseLong(ELAPSED_PATTERN, timeDump, -1);
@@ -480,8 +493,8 @@ public final class TimeDiagnosticsActivity extends Activity {
             NtscNtpClient.Result ntscResult = NtscNtpClient.query(forceNtsc);
             String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
                 calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
-                forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig, trendPoints,
-                ntscResult);
+                forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
+                nitzCalibrationStatus, trendPoints, ntscResult);
             runOnUiThread(() -> {
                 refreshInProgress = false;
                 refreshButton.setEnabled(true);
@@ -501,7 +514,8 @@ public final class TimeDiagnosticsActivity extends Activity {
             String calibrationState, String calibrationDetail, long calibrationTime,
             long calibrationStartElapsed,
             String forceState, String forceDetail, long forceTime, String thresholdStatus,
-            String thresholdConfig, List<TrendPoint> trendPoints,
+            String thresholdConfig, String nitzCalibrationStatus,
+            List<TrendPoint> trendPoints,
             NtscNtpClient.Result ntscResult) {
         currentDiagnosticsHasRoot = hasRoot;
         currentForceOptions = new ForceOption[0];
@@ -604,12 +618,26 @@ public final class TimeDiagnosticsActivity extends Activity {
         String telephonySlotNote = telephonySlot >= 0
             ? "卡槽 " + telephonySlot + (multiSlot ? "（双卡：仅显示该卡槽样本）" : "")
             : (multiSlot ? "双卡：未能确认样本卡槽" : null);
+        // NITZ calibration state, published by the hook as debug.nitz.calibration:
+        // "calibrated|<offset>|<samples>|<carrier>" or "uncalibrated|<carrier>".
+        // Empty means the hook has not published anything yet (no NITZ sample
+        // seen since boot, or an older module build without calibration).
+        NitzCalibrationDisplay nitzCalibration =
+            parseNitzCalibrationStatus(nitzCalibrationStatus);
+        String nitzCalibrationNote = nitzCalibration == null ? null
+            : nitzCalibration.displayText();
+        if (nitzCalibrationNote != null) {
+            telephonySlotNote = telephonySlotNote == null ? nitzCalibrationNote
+                : telephonySlotNote + "；" + nitzCalibrationNote;
+        }
         long gnssUncertainty = gnssDisplay != null && nowElapsed >= 0
             ? uncertaintyFor("GNSS 卫星",
                 Math.max(0L, nowElapsed - gnssDisplay.elapsedRealtimeMillis), -1) : -1L;
+        boolean nitzCalibrated = nitzCalibration != null && nitzCalibration.calibrated;
         long telephonyUncertainty = telephonyDisplay != null && nowElapsed >= 0
-            ? uncertaintyFor("基站 NITZ",
-                Math.max(0L, nowElapsed - telephonyDisplay.elapsedRealtimeMillis), -1) : -1L;
+            ? nitzUncertainty(
+                Math.max(0L, nowElapsed - telephonyDisplay.elapsedRealtimeMillis),
+                nitzCalibrated) : -1L;
         long networkTotalUncertainty = networkDisplay != null && nowElapsed >= 0
             ? uncertaintyFor("网络 NTP",
                 Math.max(0L, nowElapsed - networkDisplay.elapsedRealtimeMillis),
@@ -1645,6 +1673,66 @@ public final class TimeDiagnosticsActivity extends Activity {
             base = GNSS_BASE_UNCERTAINTY_MILLIS;
         }
         return base + driftBudgetMillis(ageMillis);
+    }
+
+    /**
+     * NITZ uncertainty with calibration taken into account. A calibrated NITZ
+     * sample starts at +/-200 ms instead of +/-1500 ms: the learned
+     * per-carrier bias removes the fixed part of the error, but delivery
+     * jitter and staleness remain. The force-jump path deliberately keeps the
+     * uncalibrated +/-1500 ms figure (see forceUncertaintyMillis): a forced
+     * jump is a one-shot correction, not a place to trust a learned bias.
+     */
+    private static long nitzUncertainty(long ageMillis, boolean calibrated) {
+        long base = calibrated
+            ? NITZ_CALIBRATED_BASE_UNCERTAINTY_MILLIS : NITZ_BASE_UNCERTAINTY_MILLIS;
+        return base + driftBudgetMillis(ageMillis);
+    }
+
+    /**
+     * Parses the hook's debug.nitz.calibration property:
+     * "calibrated|&lt;offsetMillis&gt;|&lt;samples&gt;|&lt;carrierKey&gt;" or
+     * "uncalibrated|&lt;carrierKey&gt;". Returns null when the property is empty
+     * or unparsable (hook not loaded, or no NITZ sample seen since boot).
+     */
+    private static NitzCalibrationDisplay parseNitzCalibrationStatus(String status) {
+        if (status == null || status.isEmpty()) return null;
+        String[] parts = status.split("\\|");
+        if (parts.length < 2) return null;
+        if ("calibrated".equals(parts[0]) && parts.length >= 4) {
+            try {
+                long offset = Long.parseLong(parts[1]);
+                int samples = Integer.parseInt(parts[2]);
+                return new NitzCalibrationDisplay(true, offset, samples, parts[3]);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        if ("uncalibrated".equals(parts[0])) {
+            return new NitzCalibrationDisplay(false, 0L, 0, parts[1]);
+        }
+        return null;
+    }
+
+    private static final class NitzCalibrationDisplay {
+        final boolean calibrated;
+        final long offsetMillis;
+        final int samples;
+        final String carrierKey;
+
+        NitzCalibrationDisplay(boolean calibrated, long offsetMillis, int samples,
+                String carrierKey) {
+            this.calibrated = calibrated;
+            this.offsetMillis = offsetMillis;
+            this.samples = samples;
+            this.carrierKey = carrierKey;
+        }
+
+        String displayText() {
+            if (!calibrated) return "基站未校准";
+            String sign = offsetMillis >= 0 ? "+" : "";
+            return "基站已校准，偏移 " + sign + offsetMillis + "ms（基于 " + samples + " 次学习）";
+        }
     }
 
     /** Sync tolerance grows with sample age and uncertainty; it is not a fixed 100 ms. */

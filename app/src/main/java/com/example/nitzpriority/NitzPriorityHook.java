@@ -15,9 +15,11 @@ import java.util.Set;
 
 public final class NitzPriorityHook implements IXposedHookLoadPackage {
     private static final String TAG = "NitzPriority";
-    private static final int ORIGIN_TELEPHONY = 1;
-    private static final int ORIGIN_NETWORK = 3;
-    private static final int ORIGIN_GNSS = 4;
+    // Origin constants are package-visible so NitzCalibrator can reuse the
+    // same values instead of defining its own copies.
+    static final int ORIGIN_TELEPHONY = 1;
+    static final int ORIGIN_NETWORK = 3;
+    static final int ORIGIN_GNSS = 4;
     static final int AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS = 1000;
     // Per-origin automatic clock-update thresholds (ms). AOSP's
     // mSystemClockUpdateThresholdMillis is a single global value with no
@@ -68,6 +70,7 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
     private static volatile int lastLoggedDecisionThreshold = -1;
 
     private final NitzSampleMonitor sampleMonitor = new NitzSampleMonitor();
+    private final NitzCalibrator nitzCalibrator = new NitzCalibrator();
     private final GnssTriggerBridge gnssTriggerBridge = new GnssTriggerBridge();
     private boolean gnssRuntimeEnabled;
     private volatile int originalClockUpdateThresholdMillis = -1;
@@ -425,6 +428,22 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                         // Record the suggestion's elapsed time so the decision hook can
                         // recognise a telephony time being decided on (2000 ms threshold).
                         recordSuggestionElapsed(ORIGIN_TELEPHONY, param.args[0]);
+                        // NITZ calibration: learn this carrier's fixed bias from a
+                        // fresh GNSS / NTP reference, or apply the learned bias
+                        // when no fresh reference exists. A non-null return is a
+                        // replacement suggestion carrying the corrected unix time;
+                        // swapping it into the live argument array is how the
+                        // correction reaches the strategy. Any failure leaves the
+                        // original suggestion untouched (fail-closed).
+                        try {
+                            Object replacement = nitzCalibrator.onTelephonySuggestion(
+                                lpparam, param.args[0]);
+                            if (replacement != null && replacement != param.args[0]) {
+                                param.args[0] = replacement;
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": nitz calibration failed safely: " + t);
+                        }
                     }
                 }
             );
@@ -544,9 +563,21 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
             default:
                 break;
         }
+        // Feed the calibrator's reference store: GNSS and network suggestions
+        // are the only references NITZ can learn from. Telephony suggestions
+        // are never references.
+        if (origin == ORIGIN_GNSS || origin == ORIGIN_NETWORK) {
+            try {
+                NitzCalibrator.recordReference(origin, suggestion);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": nitz calibration reference failed safely: " + t);
+            }
+        }
     }
 
-    private static boolean isGnssSuggestionFresh() {
+    // Package-visible so NitzCalibrator reuses the same 10-minute freshness
+    // gate instead of defining its own copy.
+    static boolean isGnssSuggestionFresh() {
         long last = lastGnssSuggestionElapsedMillis;
         if (last < 0) return false;
         long age = SystemClock.elapsedRealtime() - last;
