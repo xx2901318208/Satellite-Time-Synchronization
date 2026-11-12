@@ -281,7 +281,11 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
     private static void setSystemProperty(XC_LoadPackage.LoadPackageParam lpparam, String name,
             String value) {
         try {
-            Class<?> systemProperties = findClass("android.os.SystemProperties", lpparam);
+            // Static helper shared by instance and static publishers, so the
+            // lookup must not go through the instance findClass(): same
+            // Class.forName call that findClass wraps.
+            Class<?> systemProperties = Class.forName(
+                "android.os.SystemProperties", false, lpparam.classLoader);
             Method set = systemProperties.getDeclaredMethod("set", String.class, String.class);
             set.setAccessible(true);
             set.invoke(null, name, value);

@@ -1330,7 +1330,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         Sample telephony = findLatestSample(timeDump, "TelephonyTimeSuggestion");
         Sample network = findLatestSample(timeDump, "NetworkTimeSuggestion");
         long networkUncertainty = findNetworkUncertainty(timeDump);
-        Sample gnssService = findGnssServiceSample(gnssDump);
+        Sample gnssServiceSample = findGnssServiceSample(gnssDump);
         List<ForceOption> options = new ArrayList<>();
         addForceOption(options, "GNSS 卫星", gnss, nowElapsed, systemUnix, -1);
         addForceOption(options, "基站 NITZ", telephony, nowElapsed, systemUnix, -1);
@@ -1429,7 +1429,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         html.append(" · 当前时钟 ").append(systemUnix).append(" ms</div>")
             .append(sourceCard("GNSS 卫星", gnssDisplay, nowElapsed, systemUnix,
                 NitzPriorityHook.GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS,
-                gnssService == null ? null : nowElapsed - gnssService.elapsedRealtimeMillis,
+                gnssServiceSample == null ? null : nowElapsed - gnssServiceSample.elapsedRealtimeMillis,
                 gnssUncertainty, null))
             .append(sourceCard("基站 NITZ", telephonyDisplay, nowElapsed, systemUnix,
                 NitzPriorityHook.TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS,
