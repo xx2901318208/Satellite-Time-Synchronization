@@ -3,7 +3,11 @@ package com.example.nitzpriority;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -131,6 +135,7 @@ public final class TimeDiagnosticsActivity extends Activity {
     private final ExecutorService forceWorker = Executors.newSingleThreadExecutor();
     private WebView webView;
     private Button refreshButton;
+    private Button copyLogButton;
     private ProgressBar refreshProgress;
     private String lastShownHtml;
     private int pendingScrollY = -1;
@@ -138,6 +143,14 @@ public final class TimeDiagnosticsActivity extends Activity {
     private Button clearHistoryButton;
     private Button applyThresholdButton;
     private EditText thresholdInput;
+    // Latest refresh snapshot, kept so "copy diagnostic log" reuses the data
+    // already on screen instead of running dumpsys a second time. Written on
+    // the refresh worker thread, read on the UI thread.
+    private volatile DiagnosticSnapshot lastDiagnosticSnapshot;
+    // A copy/share tapped before the first refresh landed: run it when the
+    // refresh that is already in flight (or just started) completes.
+    private volatile boolean pendingCopyAfterRefresh;
+    private volatile boolean pendingShareAfterRefresh;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private volatile boolean refreshInProgress;
     private volatile boolean forceJumpInProgress;
@@ -169,6 +182,14 @@ public final class TimeDiagnosticsActivity extends Activity {
         refreshButton.setText("刷新");
         styleButton(refreshButton, 0xFFDDF4FF, 0xFF165B78);
         actions.addView(refreshButton, new LinearLayout.LayoutParams(0, -2, 1));
+        // One-tap diagnostic log: copies the full text log to the clipboard.
+        // Long-press shares it instead (ACTION_SEND plain text).
+        copyLogButton = new Button(this);
+        copyLogButton.setText("复制日志");
+        styleButton(copyLogButton, 0xFFE5EFF7, 0xFF365C78);
+        LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(0, -2, 1);
+        copyParams.leftMargin = dp(8);
+        actions.addView(copyLogButton, copyParams);
         Button calibrateButton = new Button(this);
         calibrateButton.setText("立即校准");
         styleButton(calibrateButton, 0xFF287FDB, Color.WHITE);
@@ -305,6 +326,11 @@ public final class TimeDiagnosticsActivity extends Activity {
         installSafeAreaInsets(root);
 
         refreshButton.setOnClickListener(view -> refresh(true));
+        copyLogButton.setOnClickListener(view -> copyDiagnosticLog());
+        copyLogButton.setOnLongClickListener(view -> {
+            shareDiagnosticLog();
+            return true;
+        });
         clearHistoryButton.setOnClickListener(view -> confirmClearHistory());
         applyThresholdButton.setOnClickListener(view -> applyThresholdSetting());
         calibrateButton.setOnClickListener(view ->
@@ -572,6 +598,14 @@ public final class TimeDiagnosticsActivity extends Activity {
                     ntscResult.queryElapsedRealtimeMillis, ntscResult.offsetMillis,
                     ntscResult.uncertaintyMillis, ClockDriftEstimator.SOURCE_NTP);
             }
+            // Keep this refresh for the copy-log button: it reuses exactly
+            // these dumps and results instead of running dumpsys a second time.
+            lastDiagnosticSnapshot = new DiagnosticSnapshot(hasRoot, identity,
+                timeDump, gnssDump, thresholdStatus, thresholdConfig,
+                nitzCalibrationStatus, calibrationState, calibrationDetail,
+                calibrationTime, calibrationStartElapsed, forceState, forceDetail,
+                forceTime, trendPoints, ntscResult,
+                System.currentTimeMillis(), SystemClock.elapsedRealtime());
             String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
                 calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
                 forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
@@ -588,6 +622,13 @@ public final class TimeDiagnosticsActivity extends Activity {
                     thresholdInput.setText(Long.toString(displayedSetting));
                 }
                 showHtml(html);
+                if (pendingCopyAfterRefresh) {
+                    pendingCopyAfterRefresh = false;
+                    copyDiagnosticLog();
+                } else if (pendingShareAfterRefresh) {
+                    pendingShareAfterRefresh = false;
+                    shareDiagnosticLog();
+                }
             });
         });
     }
@@ -596,6 +637,319 @@ public final class TimeDiagnosticsActivity extends Activity {
     private void setRefreshing(boolean refreshing) {
         if (refreshProgress != null) {
             refreshProgress.setVisibility(refreshing ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    // ---- One-tap diagnostic log (copy to clipboard, long-press to share) ----
+    //
+    // The log is built from the latest refresh snapshot only: no second
+    // dumpsys run, no second NTSC query. Ages and offsets are computed
+    // against the snapshot's own collection instant, so the numbers in the
+    // log are exactly the numbers that were on screen.
+
+    private void copyDiagnosticLog() {
+        DiagnosticSnapshot snapshot = lastDiagnosticSnapshot;
+        if (snapshot == null) {
+            // Entered the page and the first refresh has not landed yet:
+            // refresh once, then copy when it completes. Never build a
+            // log from empty data. refresh() is a no-op while one is
+            // already running, so this is safe to call unconditionally.
+            pendingCopyAfterRefresh = true;
+            Toast.makeText(this, "正在刷新诊断，完成后自动复制",
+                Toast.LENGTH_SHORT).show();
+            refresh();
+            return;
+        }
+        String log = buildDiagnosticLog(snapshot);
+        if (copyToClipboard(log)) {
+            Toast.makeText(this, "已复制诊断日志，去粘贴发给我就行",
+                Toast.LENGTH_LONG).show();
+        } else {
+            // Clipboard unavailable on this device (rare): fall back to
+            // the share sheet instead of silently dropping the log.
+            Toast.makeText(this, "剪贴板不可用，已打开分享",
+                Toast.LENGTH_LONG).show();
+            shareDiagnosticLog(log);
+        }
+    }
+
+    private void shareDiagnosticLog() {
+        DiagnosticSnapshot snapshot = lastDiagnosticSnapshot;
+        if (snapshot == null) {
+            pendingShareAfterRefresh = true;
+            Toast.makeText(this, "正在刷新诊断，完成后自动打开分享",
+                Toast.LENGTH_SHORT).show();
+            refresh();
+            return;
+        }
+        shareDiagnosticLog(buildDiagnosticLog(snapshot));
+    }
+
+    private void shareDiagnosticLog(String log) {
+        Intent share = new Intent(Intent.ACTION_SEND);
+        share.setType("text/plain");
+        share.putExtra(Intent.EXTRA_SUBJECT, "卫星对时诊断日志");
+        share.putExtra(Intent.EXTRA_TEXT, log);
+        startActivity(Intent.createChooser(share, "分享诊断日志"));
+    }
+
+    /** Full text to the clipboard; false when the clipboard refuses it. */
+    private boolean copyToClipboard(String text) {
+        try {
+            ClipboardManager clipboard =
+                (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard == null) return false;
+            // The whole log, never silently truncated: dumpsys output is
+            // already bounded by RootCommand's capture cap (~100 KB total).
+            clipboard.setPrimaryClip(ClipData.newPlainText("卫星对时诊断日志", text));
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private String appVersion() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return info.versionName + " (" + info.versionCode + ")";
+        } catch (Throwable ignored) {
+            return "未知";
+        }
+    }
+
+    private static String formatWallTime(long timeMillis) {
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA);
+        format.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
+        return format.format(new Date(timeMillis));
+    }
+
+    /**
+     * Plain-text diagnostic log for copy/share. Sections, in order:
+     * (1) header, (2) key status, (3) debug.nitz.* properties,
+     * (4) NTSC result, (5) full dumpsys time_detector, (6) full dumpsys
+     * gnss_time_update_service, (7) Time change log excerpt.
+     *
+     * <p>No passwords, tokens or keys are included anywhere in this log.
+     * Deliberately NOT included: debug.nitz.force_time / force_result and
+     * the GNSS trigger properties (debug.nitz.gnss*), because the force
+     * result property carries the one-time force-jump token
+     * ({@code <token>:OK/:FAIL}). Only the three properties the refresh
+     * already reads (clock_threshold, clock_threshold_config, calibration)
+     * are reported here.
+     */
+    private String buildDiagnosticLog(DiagnosticSnapshot s) {
+        StringBuilder log = new StringBuilder();
+        log.append("卫星对时诊断日志\n");
+        log.append("生成时间：").append(formatWallTime(System.currentTimeMillis()))
+            .append("（elapsedRealtime=").append(SystemClock.elapsedRealtime())
+            .append("ms）\n");
+        log.append("诊断数据采集于：").append(formatWallTime(s.collectedWallMillis))
+            .append("（elapsedRealtime=").append(s.collectedElapsedMillis).append("ms）\n");
+        log.append("应用版本：").append(appVersion()).append("\n");
+        log.append("本日志只含授时诊断数据，不含密码、口令或密钥。\n");
+
+        long nowElapsed = s.collectedElapsedMillis;
+        long systemUnix = parseLong(SYSTEM_TIME_PATTERN, s.timeDump, -1);
+        String autoEnabled = parseString(AUTO_ENABLED_PATTERN, s.timeDump, "unknown");
+        String priorities = parseString(PRIORITIES_PATTERN, s.timeDump, "unknown");
+        long dumpedThreshold = parseLong(THRESHOLD_PATTERN, s.timeDump, 2_000);
+        String[] thresholdStatusParts = s.thresholdStatus.split(":", 2);
+        long configuredThreshold = parseLongValue(s.thresholdConfig,
+            NitzPriorityHook.AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS);
+        configuredThreshold = Math.max(NitzPriorityHook.MIN_CLOCK_UPDATE_THRESHOLD_MILLIS,
+            Math.min(NitzPriorityHook.MAX_CLOCK_UPDATE_THRESHOLD_MILLIS, configuredThreshold));
+        long activeThreshold = thresholdStatusParts.length == 2
+            ? parseLongValue(thresholdStatusParts[0], -1L) : -1L;
+        boolean thresholdHookActive = activeThreshold == configuredThreshold
+            && thresholdStatusParts.length == 2;
+        long deviceOriginalThreshold = thresholdHookActive
+            ? parseLongValue(thresholdStatusParts[1], dumpedThreshold) : dumpedThreshold;
+
+        log.append("\n== 状态 ==\n");
+        log.append("Root：").append(s.hasRoot ? "已授权" : "未授权").append("\n");
+        if (!s.hasRoot) {
+            log.append("检查结果：").append(s.identity.trim().isEmpty()
+                ? "su 命令失败或未授权" : s.identity.trim()).append("\n");
+        }
+        log.append("自动授时：").append(autoEnabled).append("\n");
+        log.append("优先级：").append(priorities).append("\n");
+        log.append("自动改时门槛（分来源）：GNSS ")
+            .append(NitzPriorityHook.GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS)
+            .append("ms / 网络 ")
+            .append(NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS)
+            .append("ms / 基站 ")
+            .append(NitzPriorityHook.TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS)
+            .append("ms；全局回落值 ").append(configuredThreshold)
+            .append("ms；模块已命中：").append(thresholdHookActive ? "是" : "否")
+            .append("；dump 当前值 ").append(dumpedThreshold)
+            .append("ms；设备原值 ").append(deviceOriginalThreshold).append("ms\n");
+        log.append("当前时钟：").append(systemUnix < 0 ? "未知"
+            : formatWallTime(systemUnix) + "（" + systemUnix + "ms）").append("\n");
+
+        Sample gnssService = findGnssServiceSample(s.gnssDump);
+        appendLogSample(log, "GNSS 卫星", s.timeDump, "GnssTimeSuggestion", nowElapsed,
+            systemUnix, -1, gnssService, null, false);
+        NitzCalibrationDisplay nitzCalibration =
+            parseNitzCalibrationStatus(s.nitzCalibrationStatus);
+        boolean nitzCalibrated = nitzCalibration != null && nitzCalibration.calibrated;
+        appendLogSample(log, "基站 NITZ", s.timeDump, "TelephonyTimeSuggestion",
+            nowElapsed, systemUnix, -1, null,
+            nitzCalibration == null ? "未发布校准状态"
+                : nitzCalibration.displayText() + "（原始值：" + s.nitzCalibrationStatus + "）",
+            nitzCalibrated);
+        long networkUncertainty = findNetworkUncertainty(s.timeDump);
+        appendLogSample(log, "网络 NTP", s.timeDump, "NetworkTimeSuggestion",
+            nowElapsed, systemUnix, networkUncertainty, null, null, false);
+        log.append("GNSS 服务样本：");
+        if (gnssService == null) {
+            log.append("暂无样本\n");
+        } else {
+            log.append("elapsed=").append(gnssService.elapsedRealtimeMillis)
+                .append("，unix=").append(gnssService.unixEpochTimeMillis)
+                .append("（").append(formatAge(
+                    Math.max(0L, nowElapsed - gnssService.elapsedRealtimeMillis)))
+                .append("前）\n");
+        }
+        log.append("基站校准：")
+            .append(nitzCalibration == null ? "未发布校准状态"
+                : nitzCalibration.displayText())
+            .append("\n");
+
+        android.content.SharedPreferences settingsPrefs = getSharedPreferences(
+            ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE);
+        ClockDriftEstimator.Estimate estimate =
+            ClockDriftEstimator.estimate(settingsPrefs, nowElapsed);
+        log.append("漂移估计：");
+        if (estimate == null) {
+            ClockDriftEstimator.Summary summary =
+                ClockDriftEstimator.summary(settingsPrefs, nowElapsed);
+            if (summary.newestAgeMillis < 0) {
+                log.append("暂无漂移样本\n");
+            } else if (summary.newestAgeMillis > ClockDriftEstimator.MAX_SAMPLE_AGE_MILLIS) {
+                log.append("已过期：最近样本在 ")
+                    .append(formatAge(summary.newestAgeMillis)).append("前\n");
+            } else {
+                log.append("采集中：已收 ").append(summary.pointCount).append(" 个点，跨度 ")
+                    .append(formatAge(summary.spanMillis)).append("\n");
+            }
+        } else {
+            long predictedOffset =
+                ClockDriftEstimator.projectedOffsetMillis(estimate, nowElapsed);
+            long predictedError =
+                ClockDriftEstimator.projectedErrorMillis(estimate, nowElapsed);
+            log.append(String.format(Locale.US, "%+.1f", estimate.ppm)).append(" ppm（")
+                .append(estimate.ppm > 0 ? "手机走慢" : estimate.ppm < 0 ? "手机走快" : "无方向")
+                .append("），基于 ").append(estimate.pointCount).append(" 个点，跨度 ")
+                .append(formatAge(estimate.spanMillis)).append("；按此推算当前误差约 ")
+                .append(predictedOffset >= 0 ? "落后 " : "领先 ")
+                .append(Math.abs(predictedOffset)).append(" 毫秒 ±")
+                .append(predictedError).append(" 毫秒\n");
+        }
+        log.append("定期同步：")
+            .append(ClockDriftEstimator.isPeriodicSyncEnabled(settingsPrefs)
+                ? "开启（亮屏时每 5 分钟，低电量 15 分钟）" : "已关闭").append("\n");
+        log.append("校准状态：").append(s.calibrationState)
+            .append("（").append(s.calibrationDetail).append("）");
+        if (s.calibrationTime > 0) {
+            log.append("，时间：").append(formatWallTime(s.calibrationTime));
+        }
+        log.append("\n");
+        log.append("强制跳改：").append(s.forceState)
+            .append("（").append(s.forceDetail).append("）");
+        if (s.forceTime > 0) {
+            log.append("，时间：").append(formatWallTime(s.forceTime));
+        }
+        log.append("\n");
+        log.append("GNSS 趋势点：")
+            .append(s.trendPoints == null ? 0 : s.trendPoints.size()).append(" 个（最近 6 小时）\n");
+
+        log.append("\n== 系统属性 debug.nitz.* ==\n");
+        log.append("debug.nitz.clock_threshold=").append(s.thresholdStatus).append("\n");
+        log.append("debug.nitz.clock_threshold_config=").append(s.thresholdConfig).append("\n");
+        log.append("debug.nitz.calibration=").append(s.nitzCalibrationStatus).append("\n");
+        log.append("（注：force_time / force_result 与 gnss 触发属性未列入，它们带有一次性跳改口令。）\n");
+
+        log.append("\n== 国家授时中心 NTP 参考 ==\n");
+        NtscNtpClient.Result ntsc = s.ntscResult;
+        if (ntsc == null) {
+            log.append("尚未查询授时中心时间。\n");
+        } else if (!ntsc.success) {
+            log.append("本次查询失败：").append(ntsc.error == null ? "未知原因" : ntsc.error)
+                .append("\n");
+            if (ntsc.lastGood != null) {
+                log.append("上次成功结果（")
+                    .append(formatAge(ntsc.lastGood.ageMillis(nowElapsed))).append("前，命中 ")
+                    .append(ntsc.lastGood.server).append("）：偏移 ")
+                    .append(ntsc.lastGood.offsetMillis).append("ms，不确定度 ±")
+                    .append(ntsc.lastGood.uncertaintyMillis).append("ms\n");
+            }
+        } else {
+            log.append("成功：命中 ").append(ntsc.server);
+            if (ntsc.fallback) log.append("（已回落到 cn.pool.ntp.org，非授时中心直连）");
+            log.append("\n偏移：").append(ntsc.offsetMillis)
+                .append("ms（正值=本机落后），不确定度 ±").append(ntsc.uncertaintyMillis)
+                .append("ms；往返延迟中位 ").append(ntsc.medianRttMillis)
+                .append("ms；采样 ").append(ntsc.samplesAttempted).append(" 次，取 ")
+                .append(ntsc.sampleCount).append(" 次中位数；样本 ")
+                .append(formatAge(ntsc.ageMillis(nowElapsed))).append("前");
+            if (ntsc.isExpired(nowElapsed)) log.append("（已超过 10 分钟）");
+            log.append("\n");
+        }
+
+        log.append("\n== dumpsys time_detector（全文） ==\n");
+        log.append(s.timeDump == null || s.timeDump.isEmpty() ? "（无输出）\n" : s.timeDump);
+        if (s.timeDump == null || !s.timeDump.endsWith("\n")) log.append("\n");
+        log.append("\n== dumpsys gnss_time_update_service（全文） ==\n");
+        log.append(s.gnssDump == null || s.gnssDump.isEmpty() ? "（无输出）\n" : s.gnssDump);
+        if (s.gnssDump == null || !s.gnssDump.endsWith("\n")) log.append("\n");
+        log.append("\n== Time change log（摘录） ==\n");
+        log.append(extractTimeDetectorExcerpt(s.timeDump)).append("\n");
+        return log.toString();
+    }
+
+    /** One source's latest sample line in the log, same parsers as the page. */
+    private static void appendLogSample(StringBuilder log, String name, String timeDump,
+            String className, long nowElapsed, long systemUnix, long reportedUncertainty,
+            Sample gnssService, String extraNote, boolean nitzCalibrated) {
+        ResolvedSample resolved = resolveSamples(timeDump, className, nowElapsed);
+        Sample sample = resolved.sample;
+        log.append(name).append("：");
+        if (sample == null || nowElapsed < 0) {
+            log.append("尚无时间建议记录\n");
+            return;
+        }
+        long age = nowElapsed - sample.elapsedRealtimeMillis;
+        if (age < 0 || systemUnix < 0) {
+            log.append("样本参考时间无效（elapsed=")
+                .append(sample.elapsedRealtimeMillis).append("，unix=")
+                .append(sample.unixEpochTimeMillis).append("）\n");
+            return;
+        }
+        long uncertainty;
+        if ("基站 NITZ".equals(name)) {
+            uncertainty = nitzUncertainty(age, nitzCalibrated);
+        } else {
+            uncertainty = uncertaintyFor(name, age, reportedUncertainty);
+        }
+        long projected = projectedMillis(sample, nowElapsed);
+        log.append("elapsed=").append(sample.elapsedRealtimeMillis)
+            .append("，unix=").append(sample.unixEpochTimeMillis)
+            .append("，年龄=").append(formatAge(age))
+            .append("，外推差值=").append(projected - systemUnix)
+            .append("ms（正值=本机落后），不确定度 ±").append(uncertainty).append("ms");
+        if (resolved.droppedOutlier) {
+            log.append("（最新样本与中位数相差超过 2 秒，已按中位数显示）");
+        }
+        log.append("\n");
+        if ("GNSS 卫星".equals(name)) {
+            log.append("  GNSS 服务样本：")
+                .append(gnssService == null ? "暂无样本"
+                    : "最近样本 " + formatAge(
+                        Math.max(0L, nowElapsed - gnssService.elapsedRealtimeMillis)) + "前")
+                .append("\n");
+        }
+        if (extraNote != null) {
+            log.append("  ").append(extraNote).append("\n");
         }
     }
 
@@ -2236,6 +2590,58 @@ public final class TimeDiagnosticsActivity extends Activity {
         forceWorker.shutdown();
         if (webView != null) webView.destroy();
         super.onDestroy();
+    }
+
+    /** One refresh's raw data, kept for the copy-log button. Immutable after
+     * construction; the derived per-source lines in the log are recomputed
+     * from these dumps with the same parsers the page itself uses. */
+    private static final class DiagnosticSnapshot {
+        final boolean hasRoot;
+        final String identity;
+        final String timeDump;
+        final String gnssDump;
+        final String thresholdStatus;
+        final String thresholdConfig;
+        final String nitzCalibrationStatus;
+        final String calibrationState;
+        final String calibrationDetail;
+        final long calibrationTime;
+        final long calibrationStartElapsed;
+        final String forceState;
+        final String forceDetail;
+        final long forceTime;
+        final List<TrendPoint> trendPoints;
+        final NtscNtpClient.Result ntscResult;
+        final long collectedWallMillis;
+        final long collectedElapsedMillis;
+
+        DiagnosticSnapshot(boolean hasRoot, String identity, String timeDump,
+                String gnssDump, String thresholdStatus, String thresholdConfig,
+                String nitzCalibrationStatus, String calibrationState,
+                String calibrationDetail, long calibrationTime,
+                long calibrationStartElapsed, String forceState, String forceDetail,
+                long forceTime, List<TrendPoint> trendPoints,
+                NtscNtpClient.Result ntscResult, long collectedWallMillis,
+                long collectedElapsedMillis) {
+            this.hasRoot = hasRoot;
+            this.identity = identity;
+            this.timeDump = timeDump;
+            this.gnssDump = gnssDump;
+            this.thresholdStatus = thresholdStatus;
+            this.thresholdConfig = thresholdConfig;
+            this.nitzCalibrationStatus = nitzCalibrationStatus;
+            this.calibrationState = calibrationState;
+            this.calibrationDetail = calibrationDetail;
+            this.calibrationTime = calibrationTime;
+            this.calibrationStartElapsed = calibrationStartElapsed;
+            this.forceState = forceState;
+            this.forceDetail = forceDetail;
+            this.forceTime = forceTime;
+            this.trendPoints = trendPoints;
+            this.ntscResult = ntscResult;
+            this.collectedWallMillis = collectedWallMillis;
+            this.collectedElapsedMillis = collectedElapsedMillis;
+        }
     }
 
     private static final class ClockSetEvent {
