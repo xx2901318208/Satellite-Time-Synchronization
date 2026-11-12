@@ -1,11 +1,11 @@
 # 卫星对时 — LSPosed 源码工程
 
-模块在 Android `system_server` 中尝试启用 AOSP GNSS 时间服务；服务类存在且单一资源 hook 成功时，将时间源排序为 GNSS → 电话网 NITZ → 网络，并在自动改时决策路径上按来源应用分来源门槛：GNSS 10 ms、网络 50 ms、基站 2000 ms；全局回落值默认 1000 ms，诊断页可调 100–2000 ms。
+模块在 Android `system_server` 中尝试启用 AOSP GNSS 时间服务；服务类存在且单一资源 hook 成功时，将时间源排序为 GNSS → 电话网 NITZ → 网络，并在自动改时决策路径上按来源应用分来源门槛：GNSS 20 ms、网络 50 ms、基站 2000 ms；全局回落值默认 1000 ms，诊断页可调 100–2000 ms。
 
 ## 安全边界与已知限制
 
 - 当前版本用 Android SDK Platform 35、JDK 17 编译；没有在 PKJ110 真机上验证。ColorOS 可能修改系统服务、资源或启动路径，GNSS 启用结果需以设备日志为准。
-- 模块既 hook `ConfigurationInternal.getSystemClockUpdateThresholdMillis()`，也在 `TimeDetectorStrategyImpl.setSystemClockAndConfidenceUnderWakeLock()` 实际决策入口按配置属性覆盖当前阈值。诊断属性仅在实际访问/决策路径命中后报告 `当前门槛:设备原始值`；仅注册 hook 时显示 `armed`。诊断页可输入 100–2000 ms，改的是全局回落值（默认 1000 ms）；GNSS 10 ms、网络 50 ms、基站 2000 ms 各有自己的门槛。调低门槛只会让较小差值更容易触发自动跳时，不会提高 GNSS/NITZ/NTP 样本精度，并可能导致频繁微调。
+- 模块既 hook `ConfigurationInternal.getSystemClockUpdateThresholdMillis()`，也在 `TimeDetectorStrategyImpl.setSystemClockAndConfidenceUnderWakeLock()` 实际决策入口按配置属性覆盖当前阈值。诊断属性仅在实际访问/决策路径命中后报告 `当前门槛:设备原始值`；仅注册 hook 时显示 `armed`。诊断页可输入 100–2000 ms，改的是全局回落值（默认 1000 ms）；GNSS 20 ms、网络 50 ms、基站 2000 ms 各有自己的门槛。调低门槛只会让较小差值更容易触发自动跳时，不会提高 GNSS/NITZ/NTP 样本精度，并可能导致频繁微调。
 - 模块仅在 `android` 系统进程中运行。若 `GnssTimeUpdateService$Lifecycle` 类不存在，模块不会启用 GNSS 资源，也不会把 GNSS 加入优先级。
 - 若服务类存在，模块仅 hook `Resources.getBoolean(int)`，并只对 `com.android.internal.R.bool.config_enableGnssTimeUpdateService` 对应的精确资源 ID 返回 `true`；其余布尔资源保持原值。模块不手动构造或启动 SystemService，以保留 Android 正常生命周期流程。
 - 成功 hook 资源开关不代表一定收到 GNSS 时间。系统仍需要 GPS provider、定位开关和 GNSS 定位更新。AOSP 服务被动监听位置更新，不会主动开启 GPS；室外开阔环境及已有定位请求可能有帮助。
@@ -48,11 +48,11 @@ Gradle 原始输出：`app/build/outputs/apk/debug/app-debug.apk`；交付文件
 
 1. 覆盖应用内上一次校准结果，并记录本次按钮点击时的 `elapsedRealtime` 作为新基线；本次结果只认可点击之后到达的新建议，旧系统历史记录不会被当成本次结果。
 2. 写入 `debug.nitz.gnss` 系统属性；LSPosed 在 `system_server` 中监听该属性变化。在 FgThread 上，模块会在 GNSS 服务锁内移除该服务自己的旧被动监听，再调用 `startGnssListeningInternal()` 重新注册；服务会按自身逻辑取消待执行的 4 小时闹钟。Android 17 AOSP 的方法仍存在；模块通过反射按实际运行系统调用。
-3. 按钮点击后立即启动 Android `location` 类型前台服务，持续以 1 秒最小间隔请求 `GPS_PROVIDER` 更新，最多运行 5 分钟；用户可从常驻通知或页面内停止。收到时间戳晚于本次操作基线的新 GNSS 建议后，会提前停止定位。切换到其他应用或关闭屏幕后，前台服务继续工作；结束校准或关闭页面会释放定位资源。页面每 2 秒轮询服务 dump 和建议历史，并显示位置回报次数、最近定位精度及位置时间戳年龄。
+3. 按钮点击后立即启动 Android `location` 类型前台服务，持续以 1 秒最小间隔请求 `GPS_PROVIDER` 更新，最多运行 5 分钟；用户可从常驻通知或页面内停止。收到时间戳晚于本次操作基线的新 GNSS 建议后，会提前停止定位。切换到其他应用或关闭屏幕后，定位服务随即停止，本次校准中断，返回页面需重新开始校准；结束校准或关闭页面也会释放定位资源。页面每 2 秒轮询服务 dump 和建议历史，并显示位置回报次数、最近定位精度及位置时间戳年龄。
 4. 若 `GnssTimeUpdateService.handleLocationAvailable()` 回调后仍读到旧 `mLastSuggestedGnssTime`，模块会在本次按钮请求的 5 分钟窗口内每隔至少 15 秒重新挂接一次被动监听，最多 18 次；发现新样本、收到用户取消或达到时限/次数上限即停止。此逻辑只促使服务重新读取 GPS provider 最近位置的时间字段，不会直接命令 GNSS 芯片刷新 UTC，也不保证厂商 HAL 会提供新的 `LocationTime`。校准页默认只显示当前收样状态、GPS 位置回报和卫星数量；点击“查看卫星详情”才展开各星座数量、定位耗时等技术信息。新 GNSS 建议进入 `time_detector` 才显示本次收样成功；定位结果和卫星状态回调本身不等于授时。超时结果会区分未收到样本与“系统回调到达但样本仍旧”，并给出简短的下一步提示。
 5. 校准页另外注册公开的 `GnssMeasurementsEvent.Callback` 读取 `GnssClock`。默认摘要只显示本机领先/落后 GNSS 的毫秒值及最近测量年龄；点击“查看技术详情”可展开 FullBias、Bias、TimeNanos、GPS−UTC 闰秒、不确定度、漂移和时钟不连续计数。其计算公式为 `GPS time = TimeNanos - (FullBiasNanos + BiasNanos)`，再换算为 UTC，并按共同的 `elapsedRealtime` 基准与手机时钟比较。缺少必要字段或样本异常时会明确标记不可计算。芯片报告 0 不确定度不等于真实 UTC 绝对误差为零；这些原始读数仅用于诊断，不会自动修改系统时间。原始 GnssClock 现为后备授时源：系统建议始终优先，若一直等不到系统建议，校准与强制跳改可用新鲜的原始 GnssClock 偏移完成（明确标注来源），诊断页也会单独展示原始时钟卡片。持续 GPS 会增加耗电，5 分钟上限用于避免无限后台定位。
 
-关闭校准页面会停止持续定位并记录操作取消；将应用切到后台则由 location 前台服务保持定位，位置与卫星状态通过共享首选项提供给校准页面。任务提交会检查线程池状态，避免 Activity 销毁后仍向已关闭的 worker 提交任务。root 命令会并行读取输出，避免先等待进程退出、再读取管道造成卡住或丢失基线。
+关闭校准页面会停止持续定位并记录操作取消；将应用切到后台同样会停止定位服务（本次校准中断，返回需重开），位置与卫星状态通过共享首选项提供给校准页面。任务提交会检查线程池状态，避免 Activity 销毁后仍向已关闭的 worker 提交任务。root 命令会并行读取输出，避免先等待进程退出、再读取管道造成卡住或丢失基线。
 
 按钮需要在 LSPosed 中启用模块并授予 `android`/系统进程作用域、允许应用获得 root、授予精确定位权限，并开启系统定位。首次开始后台持续定位时会请求通知权限，以展示常驻任务和停止入口。建议在室外开阔处使用。重新挂接只让系统服务重新读取已有 GPS provider 的最近位置，不会直接开启卫星接收机或制造 GNSS 时间；持续位置请求和有限重挂仍需 GNSS HAL 返回有效的新 `LocationTime`。ROM 修改私有服务字段/方法时，桥接会安全失败并写入 LSPosed 日志。
 
@@ -60,9 +60,17 @@ Gradle 原始输出：`app/build/outputs/apk/debug/app-debug.apk`；交付文件
 
 ## 授时诊断/日志页面
 
-主页面优先显示手机时钟是否与卫星时间对齐。只有 GNSS 建议样本不超过 10 分钟，且外推后手机与卫星时间偏差在动态判定容差内（100 毫秒基础 + 年龄漂移预算 + 来源不确定度），才显示“手机时钟已与卫星时间同步”；收到新建议本身不代表手机时钟已经调整。“本次 GNSS 实际校时”检查 Android `Time change log` 中本次操作后的 `Set system clock ... origin=gnss` 记录。“实际改时来源与系统动作”事件时间线按系统日志显示改钟来源、调整方向与毫秒差；置信度更新单独标记。新增“与北京时间参考误差”卡片，以 Android 网络 NTP 建议样本外推估算本机快/慢，并显示北京时间参考戳、样本年龄和 NTP 上报不确定度；样本超过 24 小时则不再显示估算，超过 10 分钟会标记为仅供参考。它是网络时间估算，不是独立国家授时中心校验，不确定度也不含样本外推后的额外漂移。新增“清理历史记录和日志”按钮，二次确认后清除本应用保存的 GNSS 趋势、定位诊断快照、校准及强制跳改结果，并从事件时间线隐藏清理前的系统动作；运行中的定位或跳改任务期间禁止清理。自动改时门槛设置会保留，Android 自己维护的原始 `time_detector` / `Time change log` 不会被修改或删除。诊断页和校准页统一采用浅蓝/青色液态玻璃风格，两个页面均显示署名“作者：酷安 R1263599071”。趋势图在诊断页前台每分钟采样，显示最近 6 小时记录，并标明最后观测距今多久。应用名称和桌面图标为“卫星对时”及蓝底自适应时钟图标。诊断页新增“复制日志”按钮，一键把本次诊断快照（含状态、系统属性、授时中心结果与两份 dumpsys 全文）复制到剪贴板，长按则分享；日志里不含密码、口令或密钥。
+主页面优先显示手机时钟是否与卫星时间对齐。只有 GNSS 建议样本不超过 10 分钟，且外推后手机与卫星时间偏差在动态判定容差内（100 毫秒基础 + 年龄漂移预算 + 来源不确定度），才显示“手机时钟已与卫星时间同步”；收到新建议本身不代表手机时钟已经调整。“本次 GNSS 实际校时”检查 Android `Time change log` 中本次操作后的 `Set system clock ... origin=gnss` 记录。“实际改时来源与系统动作”事件时间线按系统日志显示改钟来源、调整方向与毫秒差；置信度更新单独标记。新增“与北京时间参考误差”卡片，以 Android 网络 NTP 建议样本外推估算本机快/慢，并显示北京时间参考戳、样本年龄和 NTP 上报不确定度；样本超过 24 小时则不再显示估算，超过 1 小时则隐藏具体毫秒数（请重新采样）。它是网络时间估算，不是独立国家授时中心校验，不确定度也不含样本外推后的额外漂移。新增“清理历史记录和日志”按钮，二次确认后清除本应用保存的 GNSS 趋势、定位诊断快照、校准及强制跳改结果，并从事件时间线隐藏清理前的系统动作；运行中的定位或跳改任务期间禁止清理。自动改时门槛设置会保留，Android 自己维护的原始 `time_detector` / `Time change log` 不会被修改或删除。诊断页和校准页统一采用浅蓝/青色液态玻璃风格，两个页面均显示署名“作者：酷安 R1263599071”。趋势图在诊断页前台每分钟采样，显示最近 6 小时记录，并标明最后观测距今多久。应用名称和桌面图标为“卫星对时”及蓝底自适应时钟图标。诊断页新增“复制日志”按钮，一键把本次诊断快照（含状态、系统属性、授时中心结果与两份 dumpsys 全文）复制到剪贴板，长按则分享；日志里不含密码、口令或密钥。
 
 新增“国家授时中心 NTP 参考”卡片：诊断页独立用 UDP NTP 直查中国科学院国家授时中心（`ntp.ntsc.ac.cn`；无响应时回落 `cn.pool.ntp.org` 并注明非授时中心直连），不经过 Android 系统 Network 建议。每次查询做 5 次采样、丢弃往返延迟最大的 2 次、取剩余 3 次偏移中位数；显示格式为“本机落后/领先授时中心约 X 毫秒 ±Y 毫秒”，并给出命中服务器、往返延迟中位值、采样数和样本年龄。60 秒内重复刷新复用缓存结果，手动点“刷新”可绕过节流重新采样；无网络、DNS 失败或超时会明确报错，不静默显示旧值，旧结果超过 10 分钟标“已过期”。毫秒是显示精度，不是 1 毫秒绝对精度：公网 NTP 的典型不确定度为 10–30 毫秒，请以“差值 ± 不确定度”一起读。该卡片只作显示，不参与自动改时与强制跳改。若授时中心域名解析失败，或解析到的地址无响应，改用授时中心 IP 114.118.7.161 / 114.118.7.163 直连，卡片上注明“授时中心 IP 直连”。
+
+## 系统 NTP 走授时中心（可选，默认关闭）
+
+诊断页“系统 NTP 走授时中心”开关（默认关闭）让系统本身的网络授时也走授时中心，而不只是上面那张显示卡片。开启后，模块在 `system_server` 里把系统 NTP 服务器列表改为优先 `ntp.ntsc.ac.cn`、失败回落 `time.android.com`：主路径是在每次系统 NTP 刷新前用框架自身的 `NtpTrustedTime.setServerConfigForTests()` 装入该列表（框架自带按序尝试与“沿用上次命中的服务器”逻辑，授时中心不可达时同一次轮询内回落到 `time.android.com`）；辅路径是 hook `Resources.getStringArray(config_ntpServers)`（Android 14+）与 `Resources.getString(config_ntpServer)`（14 之前），只对精确资源 ID 生效。开关状态存在 `debug.nitz.ntp_ntsc_enabled`（"1"/"0"，Root 写入），模块每次刷新时现读现用，因此开关切换无需重启（模块已启用时），关闭后下次轮询恢复设备默认服务器；该配置只在内存里，重启即清除。系统约每 18 小时轮询一次 NTP（失败时 1 分钟重试），也会在网络变化时轮询，所以开/关的效果出现在下次轮询，切换飞行模式或重连网络可触发轮询。
+
+诊断页在授时中心卡片下方显示系统 NTP 的实际命中情况，不只显示配置值：开关状态、模块 hook 状态（`debug.nitz.ntp_status`：armed / unavailable）、`dumpsys time_detector` 网络建议历史里最近一次实际命中的服务器与时间、模块报告的上次命中（`debug.nitz.ntp_server`），以及 `cmd network_time_update_service dump` 里的当前服务器列表与上次命中。一键日志里也有同样的“系统 NTP 实际命中”段与该 dump 全文。开关已开但最近一次仍是原服务器时，卡片会明说“等待系统下次轮询”，不会伪装成功。
+
+ColorOS 适配：本机（ColorOS、Android 16）的 `dumpsys time_detector` 网络建议里带有 `mNtpServerSocketAddress=pool.ntp.org/...`，即现代 `NtpTrustedTime.TimeResult` 的形状，说明系统走的是 AOSP 网络授时路径，只是服务器列表被 ColorOS 换成了 `pool.ntp.org`；因此 hook 有真实目标。若 ColorOS 换掉了 `NtpTrustedTime` / `NetworkTimeUpdateService` 或改了类名，hook 各层会安全失败并把 `debug.nitz.ntp_status` 置为 `unavailable`，诊断页如实显示“hook 未命中，开关无效”。验证方法：开开关后切换一次飞行模式，再刷新诊断页看“最近一次系统 NTP 命中”是否变成 `ntp.ntsc.ac.cn`；或用 `adb shell cmd network_time_update_service dump` 看 `getNtpConfig()` 与 `mLastSuccessfulNtpServerUri`。授时中心本身时通时不通（2026-11-12 真机：22:27 直连成功，22:31 无响应回落 pool），回落链就是为此准备的。
 
 估算偏差是把样本按 `elapsedRealtime` 外推到当前时刻后与手机时钟比较，**不是与真实北京时间的绝对误差**。诊断页门槛输入范围为 100–2000 ms，改的是全局回落值（默认 1000 ms）；Root 写入配置属性后，system_server 在后续授时决策中读取。显示“设定值、生效待确认”时，需等待一次时间建议决策再刷新。改时阈值不是精度承诺；过低门槛可能造成时钟微调频繁。每次按钮操作都会重置应用内的旧校准结果并使用新的单调基线过滤旧建议；Android `dumpsys` 历史由系统管理，不会被模块清空，只用于本次基线之后的改时判断。
 

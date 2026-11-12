@@ -152,13 +152,18 @@ public final class FloatingClockService extends Service {
                 ClockDriftEstimator.Estimate estimate = ClockDriftEstimator.estimate(
                     prefs, SystemClock.elapsedRealtime());
                 if (estimate != null) {
-                    long predicted = ClockDriftEstimator.projectedErrorMillis(estimate,
+                    // Drift growth only: the last sample's measurement
+                    // uncertainty is noise, not drift, and it alone
+                    // (NTSC RTT/2, raw GNSS) routinely exceeds the 50 ms
+                    // threshold, which used to fire early sync on almost
+                    // every tick. See projectedDriftMillis.
+                    long predictedDrift = ClockDriftEstimator.projectedDriftMillis(estimate,
                         SystemClock.elapsedRealtime() + interval);
-                    if (predicted
+                    if (predictedDrift
                             > NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS) {
                         handler.removeCallbacks(periodicSync);
                         handler.postDelayed(periodicSync, EARLY_SYNC_DELAY_MILLIS);
-                        Log.i(TAG, "periodic sync: early sync, predicted error " + predicted
+                        Log.i(TAG, "periodic sync: early sync, predicted drift " + predictedDrift
                             + "ms exceeds 50ms network threshold");
                     }
                 }

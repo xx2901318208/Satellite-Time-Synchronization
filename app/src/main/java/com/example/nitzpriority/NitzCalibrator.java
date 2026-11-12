@@ -83,7 +83,9 @@ final class NitzCalibrator {
     // Learning samples must agree with each other this tightly to be trusted.
     private static final long MAX_SPREAD_MILLIS = 200L;
     private static final int MAX_SAMPLES_PER_CARRIER = 20;
-    private static final int MIN_SAMPLES_TO_APPLY = 5;
+    // Package-visible: the diagnostics page shows "learned N/5 samples" and
+    // must use the same threshold, not a second copy of the number.
+    static final int MIN_SAMPLES_TO_APPLY = 5;
     private static final long MAX_LEARN_AGE_MILLIS = 24L * 60 * 60 * 1000;
     private static final long MIN_EPOCH_MILLIS = 1_577_836_800_000L; // 2020-01-01 UTC
     private static final long MAX_EPOCH_MILLIS = 4_102_444_800_000L; // 2100-01-01 UTC
@@ -207,11 +209,17 @@ final class NitzCalibrator {
         }
     }
 
-    /** Current calibration status for the diagnostics page, in property format. */
+    /**
+     * Current calibration status for the diagnostics page, in property format.
+     * The sample count is included even while uncalibrated, so the diagnostics
+     * page can show learning progress ("learned N/5 samples"); without it the
+     * page could not tell 0 samples from 4. The zero-sample case keeps the
+     * old two-part form, since the count is 0 there by definition.
+     */
     static String statusFor(String key, CarrierState state) {
         if (state == null || state.deltas.isEmpty()) return "uncalibrated|" + key;
         Long median = validMedian(state);
-        if (median == null) return "uncalibrated|" + key;
+        if (median == null) return "uncalibrated|" + state.deltas.size() + "|" + key;
         return "calibrated|" + median + "|" + state.deltas.size() + "|" + key;
     }
 

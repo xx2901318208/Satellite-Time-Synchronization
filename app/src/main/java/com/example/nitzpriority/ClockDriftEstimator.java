@@ -286,6 +286,24 @@ final class ClockDriftEstimator {
             + estimate.lastUncertaintyMillis;
     }
 
+    /**
+     * Predicted drift growth alone since the last sample: |ppm| * age,
+     * WITHOUT that sample's measurement uncertainty. The periodic sync's
+     * early-sync decision uses this, not {@link #projectedErrorMillis}:
+     * uncertainty is measurement noise, not drift, and it alone — NTSC
+     * RTT/2 is routinely 100-300 ms on device, raw GNSS 100 ms — already
+     * exceeds the 50 ms network threshold, so comparing the full error
+     * budget would fire early sync on almost every tick, collapsing the
+     * 5-minute interval to 60 seconds and keeping GPS running nearly
+     * non-stop indoors. projectedErrorMillis keeps its uncertainty term
+     * for display (the "+/-Y ms" shown next to the ppm figure).
+     */
+    static long projectedDriftMillis(Estimate estimate, long nowElapsed) {
+        if (estimate == null) return -1L;
+        double age = Math.max(0L, nowElapsed - estimate.lastElapsedRealtimeMillis);
+        return Math.round(Math.abs(estimate.ppm) * age / 1_000_000.0);
+    }
+
     /** Store contents for the "warming up / expired" display. */
     static Summary summary(SharedPreferences prefs, long nowElapsed) {
         if (prefs == null || nowElapsed < 0) return new Summary(0, 0, -1L);

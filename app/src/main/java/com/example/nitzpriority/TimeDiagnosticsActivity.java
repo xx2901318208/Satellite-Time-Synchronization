@@ -50,6 +50,16 @@ public final class TimeDiagnosticsActivity extends Activity {
     private static final String THRESHOLD_MARKER = "__NITZPRIORITY_THRESHOLD__";
     private static final String THRESHOLD_CONFIG_MARKER = "__NITZPRIORITY_THRESHOLD_CONFIG__";
     private static final String CALIBRATION_MARKER = "__NITZPRIORITY_CALIBRATION__";
+    private static final String HOOK_ACTIVE_MARKER = "__NITZPRIORITY_HOOK_ACTIVE__";
+    private static final String GNSS_SERVICE_MARKER = "__NITZPRIORITY_GNSS_SERVICE__";
+    private static final String NTP_SWITCH_MARKER = "__NITZPRIORITY_NTP_SWITCH__";
+    private static final String NTP_STATUS_MARKER = "__NITZPRIORITY_NTP_STATUS__";
+    private static final String NTP_SERVER_MARKER = "__NITZPRIORITY_NTP_SERVER__";
+    private static final String NTP_DUMP_MARKER = "__NITZPRIORITY_NTP_DUMP__";
+    // SharedPreferences key (in "settings") for the system-NTP switch.
+    // Default OFF; the module reads debug.nitz.ntp_ntsc_enabled instead,
+    // this pref only remembers what the user last chose.
+    private static final String NTP_NTSC_ENABLED_PREF = "ntp_ntsc_enabled";
     // Force-jump sources must all be fresh: GNSS, NITZ and NTP alike (was 24 h for
     // NITZ/NTP). NTP_REFERENCE_MAX_AGE_MILLIS below is display-only and unchanged.
     private static final long MAX_FORCE_SAMPLE_AGE_MILLIS = 600_000L;
@@ -130,6 +140,34 @@ public final class TimeDiagnosticsActivity extends Activity {
         "newSystemClockMillis=(\\d+)");
     private static final Pattern CHANGE_CAUSE_PATTERN = Pattern.compile(
         "cause=([^,\\]]+)");
+    // A "Set system clock confidence" line still carries the clock values read
+    // just before and just after the set. On stock AOSP the confidence path
+    // does not move the clock, so the two readings differ by at most the
+    // execution gap between them (0-1 ms); on this build the confidence path
+    // applies the correction as well (boot NITZ, 2026-11-12 22:25:21:
+    // actual 1794493521075 -> new 1794493521292, +217 ms; an earlier boot:
+    // +331 ms). Anything above this tolerance is a genuine clock step, not
+    // read noise. Genuine corrections are at least the system threshold
+    // (100 ms), so 10 ms sits an order of magnitude above the noise and
+    // below any real step. The log line carries a single elapsed value for
+    // both readings, so there is no separate elapsed delta to deduct; the
+    // tolerance is the deduction.
+    private static final long CLOCK_CHANGE_TOLERANCE_MILLIS = 10L;
+    // Latest system-NTP server actually used, from the network suggestion
+    // history in dumpsys time_detector: each entry carries
+    // mNtpServerSocketAddress=<host>/<ip>:<port> after its UnixEpochTime.
+    // The section is sliced first so a telephony elapsed value cannot pair
+    // with a network address.
+    private static final Pattern NTP_SERVER_ADDRESS_PATTERN = Pattern.compile(
+        "mNtpServerSocketAddress=([A-Za-z0-9.\\-]+)(?::\\d+)?");
+    private static final Pattern NTP_HISTORY_ELAPSED_PATTERN = Pattern.compile(
+        "mElapsedRealtimeMillis=(\\d+)");
+    // From `cmd network_time_update_service dump`: the server that actually
+    // answered last, and the server list the system is configured with.
+    private static final Pattern NTP_LAST_SUCCESS_PATTERN = Pattern.compile(
+        "mLastSuccessfulNtpServerUri=([^\\s]+)");
+    private static final Pattern NTP_CONFIG_LIST_PATTERN = Pattern.compile(
+        "mServerUris=\\[([^\\]]*)\\]");
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService forceWorker = Executors.newSingleThreadExecutor();
@@ -143,6 +181,10 @@ public final class TimeDiagnosticsActivity extends Activity {
     private Button clearHistoryButton;
     private Button applyThresholdButton;
     private EditText thresholdInput;
+    private Switch ntpSwitch;
+    // True while the switch is being set programmatically (refresh sync or
+    // apply result): the listener must not re-run applyNtpSwitch then.
+    private boolean ntpSwitchSyncing;
     // Latest refresh snapshot, kept so "copy diagnostic log" reuses the data
     // already on screen instead of running dumpsys a second time. Written on
     // the refresh worker thread, read on the UI thread.
@@ -263,7 +305,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         thresholdCard.addView(thresholdRow, new LinearLayout.LayoutParams(-1, -2));
 
         TextView thresholdHint = new TextView(this);
-        thresholdHint.setText("单位：毫秒（100–2000）。这里改的是全局回落值，仅用于未知来源与不新鲜的 GNSS 建议；GNSS 10ms、网络 50ms、基站 2000ms 各有自己的门槛。门槛只决定系统是否跳时，不会提高授时样本本身的精度。");
+        thresholdHint.setText("单位：毫秒（100–2000）。这里改的是全局回落值，仅用于未知来源与不新鲜的 GNSS 建议；GNSS 20ms、网络 50ms、基站 2000ms 各有自己的门槛。门槛只决定系统是否跳时，不会提高授时样本本身的精度。");
         thresholdHint.setTextSize(12);
         thresholdHint.setTextColor(Color.rgb(104, 117, 138));
         thresholdHint.setPadding(dp(4), dp(4), dp(4), dp(2));
@@ -302,6 +344,42 @@ public final class TimeDiagnosticsActivity extends Activity {
                 .putBoolean(ClockDriftEstimator.KEY_PERIODIC_SYNC_ENABLED, checked).apply();
             Toast.makeText(this, checked ? "定期同步已开启" : "定期同步已关闭",
                 Toast.LENGTH_SHORT).show();
+        });
+
+        // System-NTP server switch: when on, the module makes the system
+        // network time service try ntp.ntsc.ac.cn first and fall back to
+        // time.android.com (the framework's own multi-server list, tried in
+        // order in the same poll). Default OFF. The system only picks the
+        // new server up at its next NTP poll (about every 18 h, or on a
+        // network change), so flipping the switch needs no reboot but also
+        // has no instant effect; the NTSC card below shows the server the
+        // system actually hit, so a non-working hook is visible instead of
+        // being claimed as success.
+        LinearLayout ntpCard = new LinearLayout(this);
+        ntpCard.setOrientation(LinearLayout.VERTICAL);
+        ntpCard.setPadding(dp(14), dp(10), dp(14), dp(10));
+        ntpCard.setBackground(glassCardBackground());
+        ntpCard.setElevation(dp(3));
+        LinearLayout.LayoutParams ntpCardParams = new LinearLayout.LayoutParams(-1, -2);
+        ntpCardParams.setMargins(dp(12), dp(8), dp(12), 0);
+        root.addView(ntpCard, ntpCardParams);
+        ntpSwitch = new Switch(this);
+        ntpSwitch.setText("系统 NTP 走授时中心");
+        ntpSwitch.setTextSize(14);
+        ntpSwitch.setTypeface(null, android.graphics.Typeface.BOLD);
+        ntpSwitch.setTextColor(Color.rgb(37, 48, 66));
+        ntpSwitch.setChecked(getSharedPreferences("settings", MODE_PRIVATE)
+            .getBoolean(NTP_NTSC_ENABLED_PREF, false));
+        ntpCard.addView(ntpSwitch, new LinearLayout.LayoutParams(-1, -2));
+        TextView ntpHint = new TextView(this);
+        ntpHint.setText("开启后，系统自动授时（网络 NTP）优先用国家授时中心 ntp.ntsc.ac.cn，失败时回落到 time.android.com；关闭后下次轮询恢复设备默认服务器。需 Root 与 LSPosed 模块已启用；生效在下次系统轮询，切换飞行模式或重连网络可触发轮询。");
+        ntpHint.setTextSize(12);
+        ntpHint.setTextColor(Color.rgb(104, 117, 138));
+        ntpHint.setPadding(dp(4), dp(4), dp(4), dp(2));
+        ntpCard.addView(ntpHint, new LinearLayout.LayoutParams(-1, -2));
+        ntpSwitch.setOnCheckedChangeListener((buttonView, checked) -> {
+            if (ntpSwitchSyncing) return;
+            applyNtpSwitch(checked);
         });
 
         webView = new WebView(this);
@@ -505,12 +583,64 @@ public final class TimeDiagnosticsActivity extends Activity {
             runOnUiThread(() -> {
                 applyThresholdButton.setEnabled(currentDiagnosticsHasRoot);
                 Toast.makeText(this, success
-                        ? "全局回落门槛已设为 " + threshold + " ms；GNSS 10ms / 网络 50ms / 基站 2000ms 不变，system_server 将在后续授时决策时应用"
+                        ? "全局回落门槛已设为 " + threshold + " ms；GNSS 20ms / 网络 50ms / 基站 2000ms 不变，system_server 将在后续授时决策时应用"
                         : "设置失败，请检查 Root 授权与系统属性权限",
                     Toast.LENGTH_LONG).show();
                 refresh();
             });
         });
+    }
+
+    // Writes the system-NTP switch to debug.nitz.ntp_ntsc_enabled via root
+    // (same pattern as the threshold setting: setprop + read-back verify).
+    // The module reads the property fresh on every system NTP refresh, so
+    // no reboot is needed once the module itself is active; without the
+    // module the property is simply inert. A failed write reverts the
+    // switch to the last saved choice instead of leaving it showing a state
+    // the system does not have.
+    private void applyNtpSwitch(boolean checked) {
+        if (!currentDiagnosticsHasRoot) {
+            Toast.makeText(this, "请先授予 Root 并刷新诊断", Toast.LENGTH_LONG).show();
+            setNtpSwitchChecked(!checked);
+            return;
+        }
+        ntpSwitch.setEnabled(false);
+        final String value = checked ? "1" : "0";
+        final String command = "setprop " + NitzPriorityHook.NTP_SWITCH_PROPERTY + " "
+            + value + " && test \"$(getprop "
+            + NitzPriorityHook.NTP_SWITCH_PROPERTY + ")\" = \"" + value + "\"";
+        worker.execute(() -> {
+            RootCommand.Result result = RootCommand.run(command);
+            boolean success = result.exitCode == 0;
+            if (success) {
+                getSharedPreferences("settings", MODE_PRIVATE).edit()
+                    .putBoolean(NTP_NTSC_ENABLED_PREF, checked).apply();
+            }
+            runOnUiThread(() -> {
+                ntpSwitch.setEnabled(currentDiagnosticsHasRoot);
+                setNtpSwitchChecked(success ? checked
+                    : getSharedPreferences("settings", MODE_PRIVATE)
+                        .getBoolean(NTP_NTSC_ENABLED_PREF, false));
+                Toast.makeText(this, success
+                        ? (checked
+                            ? "系统 NTP 已改为优先授时中心（ntp.ntsc.ac.cn，失败回落 time.android.com）；下次系统 NTP 轮询时生效，切换飞行模式或重连网络可触发轮询"
+                            : "系统 NTP 已恢复设备默认服务器；下次系统 NTP 轮询时生效")
+                        : "设置失败，请检查 Root 授权与系统属性权限",
+                    Toast.LENGTH_LONG).show();
+                refresh();
+            });
+        });
+    }
+
+    // Programmatic switch change that must not re-trigger applyNtpSwitch.
+    private void setNtpSwitchChecked(boolean checked) {
+        if (ntpSwitch == null) return;
+        ntpSwitchSyncing = true;
+        try {
+            ntpSwitch.setChecked(checked);
+        } finally {
+            ntpSwitchSyncing = false;
+        }
     }
 
     private void refresh() {
@@ -549,7 +679,18 @@ public final class TimeDiagnosticsActivity extends Activity {
                 + THRESHOLD_CONFIG_MARKER + "; getprop "
                 + NitzPriorityHook.THRESHOLD_CONFIG_PROPERTY + "; echo "
                 + CALIBRATION_MARKER + "; getprop "
-                + NitzCalibrator.CALIBRATION_STATUS_PROPERTY;
+                + NitzCalibrator.CALIBRATION_STATUS_PROPERTY + "; echo "
+                + HOOK_ACTIVE_MARKER + "; getprop "
+                + NitzPriorityHook.HOOK_ACTIVE_PROPERTY + "; echo "
+                + GNSS_SERVICE_MARKER + "; getprop "
+                + NitzPriorityHook.GNSS_SERVICE_PROPERTY + "; echo "
+                + NTP_SWITCH_MARKER + "; getprop "
+                + NitzPriorityHook.NTP_SWITCH_PROPERTY + "; echo "
+                + NTP_STATUS_MARKER + "; getprop "
+                + NitzPriorityHook.NTP_STATUS_PROPERTY + "; echo "
+                + NTP_SERVER_MARKER + "; getprop "
+                + NitzPriorityHook.NTP_SERVER_PROPERTY + "; echo "
+                + NTP_DUMP_MARKER + "; cmd network_time_update_service dump";
             RootCommand.Result result = RootCommand.run(command);
             String[] parts = result.output.split(Pattern.quote(TIME_MARKER), 2);
             String identity = parts.length > 0 ? parts[0] : "";
@@ -568,8 +709,46 @@ public final class TimeDiagnosticsActivity extends Activity {
                 : new String[0];
             String thresholdConfig = calibrationParts.length > 0
                 ? calibrationParts[0].trim() : "";
-            String nitzCalibrationStatus = calibrationParts.length > 1
-                ? calibrationParts[1].trim() : "";
+            // The hook-active and GNSS-service properties are read after the
+            // calibration property, in the same root command. Empty means the
+            // hook never wrote them (module not loaded in system_server, or
+            // an older module build without this self-check). The NTP markers
+            // follow the GNSS-service value in the same shell output, in the
+            // same order the command above emits them.
+            String[] hookParts = calibrationParts.length > 1
+                ? calibrationParts[1].split(Pattern.quote(HOOK_ACTIVE_MARKER), 2)
+                : new String[0];
+            String nitzCalibrationStatus = hookParts.length > 0
+                ? hookParts[0].trim() : "";
+            String[] gnssServiceParts = hookParts.length > 1
+                ? hookParts[1].split(Pattern.quote(GNSS_SERVICE_MARKER), 2)
+                : new String[0];
+            String hookActive = gnssServiceParts.length > 0
+                ? gnssServiceParts[0].trim() : "";
+            String[] ntpSwitchParts = gnssServiceParts.length > 1
+                ? gnssServiceParts[1].split(Pattern.quote(NTP_SWITCH_MARKER), 2)
+                : new String[0];
+            String gnssService = ntpSwitchParts.length > 0
+                ? ntpSwitchParts[0].trim() : "";
+            String[] ntpStatusParts = ntpSwitchParts.length > 1
+                ? ntpSwitchParts[1].split(Pattern.quote(NTP_STATUS_MARKER), 2)
+                : new String[0];
+            String ntpSwitch = ntpStatusParts.length > 0
+                ? ntpStatusParts[0].trim() : "";
+            String[] ntpServerParts = ntpStatusParts.length > 1
+                ? ntpServerParts[1].split(Pattern.quote(NTP_SERVER_MARKER), 2)
+                : new String[0];
+            String ntpStatus = ntpServerParts.length > 0
+                ? ntpServerParts[0].trim() : "";
+            String[] ntpDumpParts = ntpServerParts.length > 1
+                ? ntpServerParts[1].split(Pattern.quote(NTP_DUMP_MARKER), 2)
+                : new String[0];
+            String ntpServer = ntpDumpParts.length > 0
+                ? ntpDumpParts[0].trim() : "";
+            // The cmd dump is the tail of the output; empty when the
+            // service does not exist (cmd prints "Can't find service" to
+            // stderr, which the root helper merges into this output).
+            String ntpDump = ntpDumpParts.length > 1 ? ntpDumpParts[1] : "";
             boolean hasRoot = result.exitCode == 0 && identity.contains("uid=0");
             // Drift samples come from the same refresh that draws the page:
             // the fresh GNSS trend point and the independent NTSC result are
@@ -604,16 +783,20 @@ public final class TimeDiagnosticsActivity extends Activity {
             // log show the same raw reading from this refresh.
             GnssLocationTrackingService.RawGnssSample rawGnss =
                 GnssLocationTrackingService.readRawSample(this);
+            SystemNtpInfo systemNtp = new SystemNtpInfo(
+                ntpSwitch, ntpStatus, ntpServer, ntpDump);
             lastDiagnosticSnapshot = new DiagnosticSnapshot(hasRoot, identity,
                 timeDump, gnssDump, thresholdStatus, thresholdConfig,
                 nitzCalibrationStatus, calibrationState, calibrationDetail,
                 calibrationTime, calibrationStartElapsed, forceState, forceDetail,
-                forceTime, trendPoints, ntscResult, rawGnss,
+                forceTime, trendPoints, ntscResult, rawGnss, hookActive, gnssService,
+                systemNtp,
                 System.currentTimeMillis(), SystemClock.elapsedRealtime());
             String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
                 calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
                 forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
-                nitzCalibrationStatus, trendPoints, ntscResult, rawGnss);
+                nitzCalibrationStatus, trendPoints, ntscResult, rawGnss,
+                hookActive, gnssService, systemNtp);
             runOnUiThread(() -> {
                 refreshInProgress = false;
                 setRefreshing(false);
@@ -624,6 +807,12 @@ public final class TimeDiagnosticsActivity extends Activity {
                     long displayedSetting = parseLongValue(thresholdConfig,
                         NitzPriorityHook.AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS);
                     thresholdInput.setText(Long.toString(displayedSetting));
+                }
+                // The switch follows the property the module actually sees,
+                // not just the saved pref: if the property was changed
+                // outside the app, the switch shows the real state.
+                if (hasRoot) {
+                    setNtpSwitchChecked("1".equals(ntpSwitch));
                 }
                 showHtml(html);
                 if (pendingCopyAfterRefresh) {
@@ -738,8 +927,8 @@ public final class TimeDiagnosticsActivity extends Activity {
      * the GNSS trigger properties (debug.nitz.gnss*), because the force
      * result property carries the one-time force-jump token
      * ({@code <token>:OK/:FAIL}). Only the three properties the refresh
-     * already reads (clock_threshold, clock_threshold_config, calibration)
-     * are reported here.
+     * already reads (clock_threshold, clock_threshold_config, calibration,
+     * hook_active, gnss_service) are reported here.
      */
     private String buildDiagnosticLog(DiagnosticSnapshot s) {
         StringBuilder log = new StringBuilder();
@@ -787,6 +976,16 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append("ms；模块已命中：").append(thresholdHookActive ? "是" : "否")
             .append("；dump 当前值 ").append(dumpedThreshold)
             .append("ms；设备原值 ").append(deviceOriginalThreshold).append("ms\n");
+        log.append("模块生效状态：");
+        if ("1".equals(s.hookActive)) {
+            log.append("模块已生效");
+            if ("absent".equals(s.gnssService)) {
+                log.append("；系统 GNSS 服务在该 ROM 上不存在，系统建议不会来，原始时钟后备可用");
+            }
+            log.append("\n");
+        } else {
+            log.append("模块未生效（未检测到 debug.nitz.hook_active；请检查：已安装 LSPosed、模块已勾选、作用域 system_server、已重启）\n");
+        }
         log.append("当前时钟：").append(systemUnix < 0 ? "未知"
             : formatWallTime(systemUnix) + "（" + systemUnix + "ms）").append("\n");
 
@@ -899,9 +1098,14 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append(s.trendPoints == null ? 0 : s.trendPoints.size()).append(" 个（最近 6 小时）\n");
 
         log.append("\n== 系统属性 debug.nitz.* ==\n");
+        log.append("debug.nitz.hook_active=").append(s.hookActive).append("\n");
+        log.append("debug.nitz.gnss_service=").append(s.gnssService).append("\n");
         log.append("debug.nitz.clock_threshold=").append(s.thresholdStatus).append("\n");
         log.append("debug.nitz.clock_threshold_config=").append(s.thresholdConfig).append("\n");
         log.append("debug.nitz.calibration=").append(s.nitzCalibrationStatus).append("\n");
+        log.append("debug.nitz.ntp_ntsc_enabled=").append(s.systemNtp.switchEnabled).append("\n");
+        log.append("debug.nitz.ntp_status=").append(s.systemNtp.status).append("\n");
+        log.append("debug.nitz.ntp_server=").append(s.systemNtp.server).append("\n");
         log.append("（注：force_time / force_result 与 gnss 触发属性未列入，它们带有一次性跳改口令。）\n");
 
         log.append("\n== 国家授时中心 NTP 参考 ==\n");
@@ -932,12 +1136,47 @@ public final class TimeDiagnosticsActivity extends Activity {
             log.append("\n");
         }
 
+        log.append("\n== 系统 NTP 实际命中 ==\n");
+        SystemNtpInfo ntp = s.systemNtp;
+        log.append("开关：").append(ntp.switchOn() ? "已开启（优先授时中心）" : "未开启（设备默认服务器）").append("\n");
+        log.append("模块 hook：");
+        if (ntp.status.isEmpty()) {
+            log.append("未确认（模块未启用或尚未发布状态）\n");
+        } else {
+            log.append(ntp.status).append("\n");
+        }
+        SystemNtpServer latestServer = findLatestSystemNtpServer(s.timeDump);
+        if (latestServer == null) {
+            log.append("最近一次系统 NTP 命中：尚无系统网络 NTP 建议记录\n");
+        } else {
+            log.append("最近一次系统 NTP 命中：").append(latestServer.host).append("（")
+                .append(formatAge(Math.max(0L, nowElapsed - latestServer.elapsedRealtimeMillis)))
+                .append("前）\n");
+        }
+        if (!ntp.server.isEmpty()) {
+            log.append("模块报告上次命中：").append(ntp.server).append("\n");
+        }
+        String ntpLastSuccessful = parseNtpLastSuccessful(ntp.dump);
+        if (!ntpLastSuccessful.isEmpty()) {
+            log.append("network_time_update_service 上次命中：").append(ntpLastSuccessful).append("\n");
+        }
+        String ntpConfigured = parseNtpConfigList(ntp.dump);
+        if (!ntpConfigured.isEmpty()) {
+            log.append("系统 NTP 服务器列表：").append(ntpConfigured).append("\n");
+        } else if (ntp.dump.contains("Can't find service")) {
+            log.append("network_time_update_service 不存在：此系统未使用 AOSP 网络授时服务\n");
+        }
+
         log.append("\n== dumpsys time_detector（全文） ==\n");
         log.append(s.timeDump == null || s.timeDump.isEmpty() ? "（无输出）\n" : s.timeDump);
         if (s.timeDump == null || !s.timeDump.endsWith("\n")) log.append("\n");
         log.append("\n== dumpsys gnss_time_update_service（全文） ==\n");
         log.append(s.gnssDump == null || s.gnssDump.isEmpty() ? "（无输出）\n" : s.gnssDump);
         if (s.gnssDump == null || !s.gnssDump.endsWith("\n")) log.append("\n");
+        log.append("\n== cmd network_time_update_service dump（全文） ==\n");
+        log.append(s.systemNtp.dump == null || s.systemNtp.dump.isEmpty() ? "（无输出）\n"
+            : s.systemNtp.dump);
+        if (s.systemNtp.dump == null || !s.systemNtp.dump.endsWith("\n")) log.append("\n");
         log.append("\n== Time change log（摘录） ==\n");
         log.append(extractTimeDetectorExcerpt(s.timeDump)).append("\n");
         return log.toString();
@@ -996,7 +1235,9 @@ public final class TimeDiagnosticsActivity extends Activity {
             String thresholdConfig, String nitzCalibrationStatus,
             List<TrendPoint> trendPoints,
             NtscNtpClient.Result ntscResult,
-            GnssLocationTrackingService.RawGnssSample rawGnss) {
+            GnssLocationTrackingService.RawGnssSample rawGnss,
+            String hookActive, String gnssService,
+            SystemNtpInfo systemNtp) {
         currentDiagnosticsHasRoot = hasRoot;
         currentForceOptions = new ForceOption[0];
         StringBuilder html = new StringBuilder(8_000);
@@ -1062,7 +1303,8 @@ public final class TimeDiagnosticsActivity extends Activity {
                     System.currentTimeMillis()))
                 .append(calibrationCard(calibrationState, calibrationDetail, calibrationTime))
                 .append(forceCard(forceState, forceDetail, forceTime))
-                .append(ntscTimeCard(ntscResult))
+                .append(ntscTimeCard(ntscResult, null, timeDump,
+                    SystemClock.elapsedRealtime()))
                 .append("<div class='foot'>没有 root 时无法读取系统授时历史，因此不会显示偏差数据。<br>作者：酷安 R1263599071</div>")
                 .append("</div></body></html>");
             return html.toString();
@@ -1126,9 +1368,11 @@ public final class TimeDiagnosticsActivity extends Activity {
             ? "卡槽 " + telephonySlot + (multiSlot ? "（双卡：仅显示该卡槽样本）" : "")
             : (multiSlot ? "双卡：未能确认样本卡槽" : null);
         // NITZ calibration state, published by the hook as debug.nitz.calibration:
-        // "calibrated|<offset>|<samples>|<carrier>" or "uncalibrated|<carrier>".
-        // Empty means the hook has not published anything yet (no NITZ sample
-        // seen since boot, or an older module build without calibration).
+        // "calibrated|<offset>|<samples>|<carrier>",
+        // "uncalibrated|<samples>|<carrier>" while still learning, or the older
+        // "uncalibrated|<carrier>" (no count). Empty means the hook has not
+        // published anything yet (no NITZ sample seen since boot, or an older
+        // module build without calibration).
         NitzCalibrationDisplay nitzCalibration =
             parseNitzCalibrationStatus(nitzCalibrationStatus);
         String nitzCalibrationNote = nitzCalibration == null ? null
@@ -1150,6 +1394,7 @@ public final class TimeDiagnosticsActivity extends Activity {
                 Math.max(0L, nowElapsed - networkDisplay.elapsedRealtimeMillis),
                 networkUncertainty) : -1L;
         html.append("<div class='card root-ok'><div class='state'>Root 已授权 · 系统数据可读取</div></div>")
+            .append(moduleStatusCard(hookActive, gnssService))
             .append(detectionWarningsCard(gnssResolved, telephonyResolved, networkResolved,
                 gnssDisplay, networkDisplay, nowElapsed))
             .append(gnssSyncCard(gnssDisplay, nowElapsed, systemUnix, autoEnabled, priorities,
@@ -1157,14 +1402,14 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append(gnssTrendCard(trendPoints, nowElapsed))
             .append(driftCard(nowElapsed))
             .append(beijingTimeCard(networkDisplay, networkUncertainty, nowElapsed, systemUnix))
-            .append(ntscTimeCard(ntscResult))
+            .append(ntscTimeCard(ntscResult, systemNtp, timeDump, nowElapsed))
             .append(calibrationCard(calibrationState, calibrationDetail, calibrationTime))
             .append(forceCard(forceState, forceDetail, forceTime));
         html.append("<div class='card'><div class='summary'>自动授时：<b>")
             .append(escape(autoEnabled)).append("</b>　优先级：<b>")
             .append(escape(priorities)).append("</b></div>")
             // Per-origin thresholds: a single number would lie now, because the
-            // decision hook applies GNSS 10 ms / network 50 ms / telephony 2000 ms
+            // decision hook applies GNSS 20 ms / network 50 ms / telephony 2000 ms
             // and only falls back to the configured global value for unknown
             // origins and stale GNSS suggestions.
             .append("<div class='threshold'>自动改时门槛（分来源）：GNSS <b>")
@@ -1202,6 +1447,32 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append("</pre></details><div class='foot'>授时诊断 · 数据由 Android 系统服务提供<br>作者：酷安 R1263599071</div>")
             .append("</div></body></html>");
         return html.toString();
+    }
+
+    /**
+     * Whether the LSPosed module is actually loaded in system_server, read
+     * from the debug.nitz.hook_active property the hook writes as soon as
+     * its entry runs. "1" means the hook is loaded; anything else (empty
+     * included) means it never ran — LSPosed not installed, module not
+     * checked, wrong scope, or no reboot yet — and the card says so
+     * directly instead of leaving the user to infer it from "模块已命中：否".
+     * When the hook is loaded but the GNSS service class does not exist on
+     * this ROM (debug.nitz.gnss_service=absent), system GNSS suggestions
+     * will never arrive and the raw GnssClock fallback is the way to get
+     * GNSS time.
+     */
+    private static String moduleStatusCard(String hookActive, String gnssService) {
+        if ("1".equals(hookActive)) {
+            StringBuilder detail = new StringBuilder("LSPosed 模块已在 system_server 中加载，hook 正在工作。");
+            if ("absent".equals(gnssService)) {
+                detail.append("系统 GNSS 服务在该 ROM 上不存在（未找到 GnssTimeUpdateService 类），系统 GNSS 建议不会来；原始 GNSS 时钟后备可用。");
+            }
+            return "<div class='card'><div class='state good'>模块已生效</div><div class='sync-detail'>"
+                + escape(detail.toString()) + "</div></div>";
+        }
+        return "<div class='card'><div class='state fail'>模块未生效</div><div class='sync-detail'>"
+            + escape("没有检测到模块写入的状态属性（debug.nitz.hook_active）。请检查：已安装 LSPosed；在 LSPosed 里勾选本模块，作用域选择 system_server；然后重启手机。")
+            + "</div></div>";
     }
 
     /**
@@ -1370,18 +1641,16 @@ public final class TimeDiagnosticsActivity extends Activity {
      * typically 10-30&nbsp;ms on the public internet) is part of the value.
      * This card is display only and is never offered as a force-jump source.
      */
-    private static String ntscTimeCard(NtscNtpClient.Result result) {
+    private static String ntscTimeCard(NtscNtpClient.Result result, SystemNtpInfo systemNtp,
+            String timeDump, long nowElapsed) {
         StringBuilder html = new StringBuilder(
             "<div class='card'><div class='name'>国家授时中心 NTP 参考</div>")
             .append("<div class='meta'>独立 NTP 直查中国科学院国家授时中心（Stratum-1）；"
                 + "只作显示，不参与自动改时与强制跳改。</div>")
             .append("<div class='divider'></div>");
         if (result == null) {
-            return html.append("<div class='action'>尚未查询授时中心时间，点“刷新”获取。</div></div>")
-                .toString();
-        }
-        long nowElapsed = SystemClock.elapsedRealtime();
-        if (!result.success) {
+            html.append("<div class='action'>尚未查询授时中心时间，点“刷新”获取。</div>");
+        } else if (!result.success) {
             html.append("<div class='action'>本次查询失败：")
                 .append(escape(result.error == null ? "未知原因" : result.error))
                 .append("。</div>");
@@ -1395,36 +1664,165 @@ public final class TimeDiagnosticsActivity extends Activity {
                     .append("，不确定度 ±").append(result.lastGood.uncertaintyMillis)
                     .append(" 毫秒。</div>");
             }
-            return html.append("</div>").toString();
+        } else {
+            long age = result.ageMillis(nowElapsed);
+            String relation = phoneRelativePhrase("国家授时中心", result.offsetMillis);
+            String color = result.offsetMillis < 0 ? "lead"
+                : result.offsetMillis > 0 ? "lag" : "equal";
+            html.append("<div class='sync-title ").append(color).append("'>")
+                .append(escape(relation))
+                .append("，不确定度 ±").append(result.uncertaintyMillis).append(" 毫秒");
+            html.append("</div><div class='sync-detail'>命中服务器：")
+                .append(escape(result.server));
+            if (result.fallback) {
+                html.append("（授时中心全部无响应，已回落到 cn.pool.ntp.org，非授时中心直连）");
+            }
+            if (result.directIp) {
+                html.append("（授时中心 IP 直连）");
+            }
+            html.append("；参考时刻：")
+                .append(escape(formatReferenceTime(
+                    System.currentTimeMillis() + result.offsetMillis)))
+                .append("；往返延迟中位 ").append(result.medianRttMillis)
+                .append(" 毫秒；采样 ").append(result.samplesAttempted)
+                .append(" 次，取 ").append(result.sampleCount)
+                .append(" 次中位数；样本 ").append(escape(formatAge(age))).append("前。");
+            if (result.isExpired(nowElapsed)) {
+                html.append("样本已超过 10 分钟，请点“刷新”重新查询。");
+            }
+            html.append("</div><div class='small'>毫秒是显示精度，不是 1 毫秒绝对精度；"
+                + "公网 NTP 的典型不确定度为 10–30 毫秒，请以“差值 ± 不确定度”一起读。</div>");
         }
-        long age = result.ageMillis(nowElapsed);
-        String relation = phoneRelativePhrase("国家授时中心", result.offsetMillis);
-        String color = result.offsetMillis < 0 ? "lead"
-            : result.offsetMillis > 0 ? "lag" : "equal";
-        html.append("<div class='sync-title ").append(color).append("'>")
-            .append(escape(relation))
-            .append("，不确定度 ±").append(result.uncertaintyMillis).append(" 毫秒");
-        html.append("</div><div class='sync-detail'>命中服务器：")
-            .append(escape(result.server));
-        if (result.fallback) {
-            html.append("（授时中心全部无响应，已回落到 cn.pool.ntp.org，非授时中心直连）");
-        }
-        if (result.directIp) {
-            html.append("（授时中心 IP 直连）");
-        }
-        html.append("；参考时刻：")
-            .append(escape(formatReferenceTime(
-                System.currentTimeMillis() + result.offsetMillis)))
-            .append("；往返延迟中位 ").append(result.medianRttMillis)
-            .append(" 毫秒；采样 ").append(result.samplesAttempted)
-            .append(" 次，取 ").append(result.sampleCount)
-            .append(" 次中位数；样本 ").append(escape(formatAge(age))).append("前。");
-        if (result.isExpired(nowElapsed)) {
-            html.append("样本已超过 10 分钟，请点“刷新”重新查询。");
-        }
-        html.append("</div><div class='small'>毫秒是显示精度，不是 1 毫秒绝对精度；"
-            + "公网 NTP 的典型不确定度为 10–30 毫秒，请以“差值 ± 不确定度”一起读。</div>");
+        html.append(systemNtpSection(systemNtp, timeDump, nowElapsed));
         return html.append("</div>").toString();
+    }
+
+    // System-NTP (automatic network time) subsection inside the NTSC card.
+    // Shows the switch state, the hook state, and — the point of this
+    // section — the server the system NTP actually hit, parsed from the
+    // dumpsys network suggestion history (ground truth) and corroborated by
+    // the hook's own last-hit property and the network_time_update_service
+    // dump. The configured value is never shown as if it were the actual one.
+    private static String systemNtpSection(SystemNtpInfo systemNtp, String timeDump,
+            long nowElapsed) {
+        StringBuilder html = new StringBuilder("<div class='divider'></div>")
+            .append("<div class='name'>系统 NTP（自动授时）</div>");
+        if (systemNtp == null) {
+            return html.append("<div class='meta'>需 Root 才能查看系统 NTP 状态。</div>")
+                .toString();
+        }
+        boolean switchOn = systemNtp.switchOn();
+        html.append("<div class='sync-detail'>开关：")
+            .append(switchOn ? "已开启（优先授时中心）" : "未开启（设备默认服务器）")
+            .append("；模块 hook：");
+        if (systemNtp.status.isEmpty()) {
+            html.append("未确认（模块未启用或尚未发布状态）");
+        } else if (systemNtp.status.startsWith("armed")) {
+            html.append("已安装");
+        } else if (systemNtp.status.startsWith("unavailable")) {
+            html.append("未命中")
+                .append(escape(systemNtp.status.substring("unavailable".length())));
+        } else {
+            html.append(escape(systemNtp.status));
+        }
+        html.append("。</div>");
+        SystemNtpServer latest = findLatestSystemNtpServer(timeDump);
+        if (latest == null) {
+            html.append("<div class='sync-detail'>尚无系统网络 NTP 建议记录。</div>");
+        } else {
+            long age = Math.max(0L, nowElapsed - latest.elapsedRealtimeMillis);
+            html.append("<div class='sync-detail'>最近一次系统 NTP 命中：")
+                .append(escape(latest.host)).append("（")
+                .append(escape(formatAge(age))).append("前）。</div>");
+        }
+        if (!systemNtp.server.isEmpty()) {
+            html.append("<div class='sync-detail'>模块报告上次命中：")
+                .append(escape(systemNtp.server)).append("。</div>");
+        }
+        String configured = parseNtpConfigList(systemNtp.dump);
+        if (!configured.isEmpty()) {
+            html.append("<div class='sync-detail'>系统 NTP 服务器列表：")
+                .append(escape(configured)).append("。</div>");
+        } else if (systemNtp.dump.contains("Can't find service")) {
+            html.append("<div class='sync-detail'>network_time_update_service 不存在："
+                + "此系统未使用 AOSP 网络授时服务，hook 无法生效。</div>");
+        }
+        html.append("<div class='sync-detail'>");
+        if (!switchOn) {
+            html.append("开关关闭，系统 NTP 使用设备默认服务器。");
+        } else if (!systemNtp.status.isEmpty()
+                && systemNtp.status.startsWith("unavailable")) {
+            html.append("hook 未命中：此系统未使用 AOSP NTP 路径（或类名已改），开关无效。");
+        } else if (latest != null
+                && NitzPriorityHook.NTP_NTSC_HOST.equals(latest.host)) {
+            html.append("系统 NTP 已命中授时中心。");
+        } else if (latest != null) {
+            html.append("开关已开，等待系统下次轮询（最近一次仍是 ")
+                .append(escape(latest.host))
+                .append("；切换飞行模式或重连网络可触发轮询）。");
+        } else {
+            html.append("开关已开，尚无系统 NTP 建议记录，等待下次轮询。");
+        }
+        html.append("</div>");
+        html.append("<div class='small'>系统按框架自身的顺序尝试服务器列表，命中后会沿用该服务器直到其失败或重启；"
+            + "授时中心不可达时同一次轮询内回落到 time.android.com。</div>");
+        return html.toString();
+    }
+
+    // Latest server the system NTP actually used, from the network
+    // suggestion history in dumpsys time_detector. Each entry has one
+    // UnixEpochTime (mElapsedRealtimeMillis) and one mNtpServerSocketAddress;
+    // entries are sliced apart so the two can never pair across entries.
+    // Null when the history has no entry with a server address (older AOSP
+    // does not print it, or no network suggestion yet).
+    private static SystemNtpServer findLatestSystemNtpServer(String timeDump) {
+        if (timeDump == null || timeDump.isEmpty()) return null;
+        int sectionStart = timeDump.indexOf("Network suggestion history:");
+        if (sectionStart < 0) return null;
+        int sectionEnd = timeDump.indexOf("Gnss suggestion history:", sectionStart);
+        String section = sectionEnd < 0 ? timeDump.substring(sectionStart)
+            : timeDump.substring(sectionStart, sectionEnd);
+        SystemNtpServer latest = null;
+        for (String entry : section.split("NetworkTimeSuggestion\\{")) {
+            Matcher elapsed = NTP_HISTORY_ELAPSED_PATTERN.matcher(entry);
+            Matcher address = NTP_SERVER_ADDRESS_PATTERN.matcher(entry);
+            if (!elapsed.find() || !address.find()) continue;
+            long elapsedMillis;
+            try {
+                elapsedMillis = Long.parseLong(elapsed.group(1));
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            if (latest == null || elapsedMillis > latest.elapsedRealtimeMillis) {
+                latest = new SystemNtpServer(address.group(1), elapsedMillis);
+            }
+        }
+        return latest;
+    }
+
+    // Host from `cmd network_time_update_service dump`'s
+    // mLastSuccessfulNtpServerUri=ntp://<host> line ("" when absent).
+    private static String parseNtpLastSuccessful(String ntpDump) {
+        if (ntpDump == null || ntpDump.isEmpty()) return "";
+        Matcher matcher = NTP_LAST_SUCCESS_PATTERN.matcher(ntpDump);
+        String last = "";
+        while (matcher.find()) last = matcher.group(1);
+        if (last.startsWith("ntp://")) last = last.substring("ntp://".length());
+        int slash = last.indexOf('/');
+        if (slash >= 0) last = last.substring(0, slash);
+        int colon = last.indexOf(':');
+        if (colon >= 0) last = last.substring(0, colon);
+        return last;
+    }
+
+    // Server list from `cmd network_time_update_service dump`'s
+    // getNtpConfig()=NtpConnectionInfo{mServerUris=[...]} line ("" when
+    // absent). Shows the list the system is actually configured with: the
+    // hook's override list when the switch is on, the device default else.
+    private static String parseNtpConfigList(String ntpDump) {
+        if (ntpDump == null || ntpDump.isEmpty()) return "";
+        Matcher matcher = NTP_CONFIG_LIST_PATTERN.matcher(ntpDump);
+        return matcher.find() ? matcher.group(1).trim() : "";
     }
 
     private static String gnssClockSetStatus(String timeDump,
@@ -1726,9 +2124,9 @@ public final class TimeDiagnosticsActivity extends Activity {
 
             Matcher setMatcher = CLOCK_SET_ORIGIN_PATTERN.matcher(line);
             Matcher confidenceMatcher = CONFIDENCE_ORIGIN_PATTERN.matcher(line);
-            boolean clockChanged = setMatcher.find();
-            boolean confidenceOnly = !clockChanged && confidenceMatcher.find();
-            if (!clockChanged && !confidenceOnly) continue;
+            boolean isSetLine = setMatcher.find();
+            boolean isConfidenceLine = !isSetLine && confidenceMatcher.find();
+            if (!isSetLine && !isConfidenceLine) continue;
 
             Matcher elapsedMatcher = CHANGE_LOG_ELAPSED_PATTERN.matcher(line);
             if (!elapsedMatcher.find()) continue;
@@ -1741,11 +2139,18 @@ public final class TimeDiagnosticsActivity extends Activity {
                     ? 0.0 : Double.parseDouble(elapsedMatcher.group(3));
                 long elapsed = hours * 3_600_000L + minutes * 60_000L
                     + Math.round(seconds * 1_000.0);
-                String origin = clockChanged ? setMatcher.group(1) : confidenceMatcher.group(1);
+                String origin = isSetLine ? setMatcher.group(1) : confidenceMatcher.group(1);
                 long oldMillis = parseLong(OLD_CLOCK_MILLIS_PATTERN, line, -1L);
                 long newMillis = parseLong(NEW_CLOCK_MILLIS_PATTERN, line, -1L);
                 String cause = localizeChangeCause(
                     parseString(CHANGE_CAUSE_PATTERN, line, "").trim());
+                // The line's wording alone does not decide whether the clock
+                // moved: a confidence line can still carry a real step (see
+                // CLOCK_CHANGE_TOLERANCE_MILLIS). Compare the clock values
+                // the line itself reports instead of trusting the label.
+                boolean clockChanged = isSetLine
+                    || (oldMillis >= 0 && newMillis >= 0
+                        && Math.abs(newMillis - oldMillis) > CLOCK_CHANGE_TOLERANCE_MILLIS);
                 events.add(new ClockActionEvent(origin, elapsed, clockChanged,
                     oldMillis, newMillis, cause));
             } catch (NumberFormatException ignored) {
@@ -2360,9 +2765,11 @@ public final class TimeDiagnosticsActivity extends Activity {
 
     /**
      * Parses the hook's debug.nitz.calibration property:
-     * "calibrated|&lt;offsetMillis&gt;|&lt;samples&gt;|&lt;carrierKey&gt;" or
-     * "uncalibrated|&lt;carrierKey&gt;". Returns null when the property is empty
-     * or unparsable (hook not loaded, or no NITZ sample seen since boot).
+     * "calibrated|&lt;offsetMillis&gt;|&lt;samples&gt;|&lt;carrierKey&gt;",
+     * "uncalibrated|&lt;samples&gt;|&lt;carrierKey&gt;" (still learning), or the
+     * older "uncalibrated|&lt;carrierKey&gt;" (no count; treated as 0 samples).
+     * Returns null when the property is empty or unparsable (hook not loaded,
+     * or no NITZ sample seen since boot).
      */
     private static NitzCalibrationDisplay parseNitzCalibrationStatus(String status) {
         if (status == null || status.isEmpty()) return null;
@@ -2378,6 +2785,14 @@ public final class TimeDiagnosticsActivity extends Activity {
             }
         }
         if ("uncalibrated".equals(parts[0])) {
+            if (parts.length >= 3) {
+                try {
+                    int samples = Integer.parseInt(parts[1]);
+                    return new NitzCalibrationDisplay(false, 0L, samples, parts[2]);
+                } catch (NumberFormatException ignored) {
+                    // Not a count; fall through to the old two-part format.
+                }
+            }
             return new NitzCalibrationDisplay(false, 0L, 0, parts[1]);
         }
         return null;
@@ -2398,9 +2813,19 @@ public final class TimeDiagnosticsActivity extends Activity {
         }
 
         String displayText() {
-            if (!calibrated) return "基站未校准";
-            String sign = offsetMillis >= 0 ? "+" : "";
-            return "基站已校准，偏移 " + sign + offsetMillis + "ms（基于 " + samples + " 次学习）";
+            if (calibrated) {
+                String sign = offsetMillis >= 0 ? "+" : "";
+                return "基站已校准，偏移 " + sign + offsetMillis + "ms（基于 " + samples + " 次学习）";
+            }
+            if (samples <= 0) return "基站未校准";
+            if (samples < NitzCalibrator.MIN_SAMPLES_TO_APPLY) {
+                return "基站学习中，已学 " + samples + "/"
+                    + NitzCalibrator.MIN_SAMPLES_TO_APPLY + " 样本";
+            }
+            // Enough samples, but the median is still unusable (samples
+            // disagree, the learning is stale, or the median is implausibly
+            // large); the hook publishes uncalibrated in all three cases.
+            return "基站学习中，已学 " + samples + " 个样本，暂未生效";
         }
     }
 
@@ -2774,6 +3199,11 @@ public final class TimeDiagnosticsActivity extends Activity {
         final List<TrendPoint> trendPoints;
         final NtscNtpClient.Result ntscResult;
         final GnssLocationTrackingService.RawGnssSample rawGnss;
+        /** Raw debug.nitz.hook_active value: "1" when the hook entry ran in system_server. */
+        final String hookActive;
+        /** Raw debug.nitz.gnss_service value: "present" / "absent" / "" (not published). */
+        final String gnssService;
+        final SystemNtpInfo systemNtp;
         final long collectedWallMillis;
         final long collectedElapsedMillis;
 
@@ -2785,6 +3215,8 @@ public final class TimeDiagnosticsActivity extends Activity {
                 long forceTime, List<TrendPoint> trendPoints,
                 NtscNtpClient.Result ntscResult,
                 GnssLocationTrackingService.RawGnssSample rawGnss,
+                String hookActive, String gnssService,
+                SystemNtpInfo systemNtp,
                 long collectedWallMillis,
                 long collectedElapsedMillis) {
             this.hasRoot = hasRoot;
@@ -2804,8 +3236,47 @@ public final class TimeDiagnosticsActivity extends Activity {
             this.trendPoints = trendPoints;
             this.ntscResult = ntscResult;
             this.rawGnss = rawGnss;
+            this.hookActive = hookActive;
+            this.gnssService = gnssService;
+            this.systemNtp = systemNtp == null ? SystemNtpInfo.empty() : systemNtp;
             this.collectedWallMillis = collectedWallMillis;
             this.collectedElapsedMillis = collectedElapsedMillis;
+        }
+    }
+
+    /** System-NTP (network time) hook state, as read in one refresh. */
+    private static final class SystemNtpInfo {
+        // Raw property values; "" when unreadable (no root / older build).
+        final String switchEnabled;
+        final String status;
+        final String server;
+        // `cmd network_time_update_service dump` output; "" when unreadable.
+        final String dump;
+
+        SystemNtpInfo(String switchEnabled, String status, String server, String dump) {
+            this.switchEnabled = switchEnabled == null ? "" : switchEnabled;
+            this.status = status == null ? "" : status;
+            this.server = server == null ? "" : server;
+            this.dump = dump == null ? "" : dump;
+        }
+
+        static SystemNtpInfo empty() {
+            return new SystemNtpInfo("", "", "", "");
+        }
+
+        boolean switchOn() {
+            return "1".equals(switchEnabled);
+        }
+    }
+
+    /** One system-NTP server actually used, with when it was used. */
+    private static final class SystemNtpServer {
+        final String host;
+        final long elapsedRealtimeMillis;
+
+        SystemNtpServer(String host, long elapsedRealtimeMillis) {
+            this.host = host;
+            this.elapsedRealtimeMillis = elapsedRealtimeMillis;
         }
     }
 

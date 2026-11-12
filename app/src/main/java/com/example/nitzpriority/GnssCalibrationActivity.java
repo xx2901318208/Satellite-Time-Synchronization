@@ -1070,6 +1070,19 @@ public final class GnssCalibrationActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        // 切后台会中断本次校准：定位服务随即停止（复用 onDestroy 的停服务
+        // 调用），轮询在 2 秒内看到服务写下的 STOPPED 状态后以 FAILED 收尾；
+        // 返回本页需重开校准。没有 onPause 时，按 Home 切后台后 GPS 会
+        // 一直跑到 5 分钟上限。只在本次操作进行中才停服务，以免打断定期
+        // 同步的 GNSS burst。
+        if (operationRunning) {
+            stopService(new Intent(this, GnssLocationTrackingService.class));
+        }
+    }
+
+    @Override
     protected void onDestroy() {
         if (operationRunning) signalRecoveryCancellation();
         activityDestroyed = true;
