@@ -33,16 +33,13 @@ final class NtscNtpClient {
     /**
      * NTSC public NTP hosts, tried in order. Domains only; the one hard-coded
      * IP ({@link #NTSC_DIRECT_IP}) is a last-resort fallback below, not a host.
-     * ntp1.ntsc.ac.cn is deliberately absent: it has no DNS record at all
-     * (verified on device 2026-11-12: ntp.ntsc.ac.cn resolves, ntp1 does not),
-     * and the official NTSC announcement only ever published ntp.ntsc.ac.cn.
-     * ntp2/ntp3 are kept for now, unverified; a dead name only costs one fast
-     * DNS failure and can no longer kill the whole query.
+     * Only ntp.ntsc.ac.cn is listed: the numbered names ntp1/ntp2/ntp3 have
+     * no DNS records at all (verified on device 2026-11-12: ntp.ntsc.ac.cn
+     * resolves, ntp1/ntp2/ntp3 all return "unknown host"), and the official
+     * NTSC announcement only ever published ntp.ntsc.ac.cn.
      */
     static final String[] NTSC_HOSTS = {
         "ntp.ntsc.ac.cn",
-        "ntp2.ntsc.ac.cn",
-        "ntp3.ntsc.ac.cn",
     };
     /**
      * NTSC official IP (published alongside ntp.ntsc.ac.cn). Used only when
@@ -87,7 +84,7 @@ final class NtscNtpClient {
     /** One NTP query result. Immutable; {@code lastGood} is only set on failures. */
     static final class Result {
         final boolean success;
-        /** Host that actually answered, e.g. "ntp2.ntsc.ac.cn". Null on failure. */
+        /** Host that actually answered, e.g. "ntp.ntsc.ac.cn" or the direct IP. Null on failure. */
         final String server;
         /** True when the answering host is the pool fallback, not NTSC. */
         final boolean fallback;
