@@ -30,13 +30,29 @@ import java.util.List;
 final class NtscNtpClient {
     private static final String TAG = "NitzPriority";
 
-    /** NTSC public NTP hosts, tried in order. Domains only, never hard-coded IPs. */
+    /**
+     * NTSC public NTP hosts, tried in order. Domains only; the one hard-coded
+     * IP ({@link #NTSC_DIRECT_IP}) is a last-resort fallback below, not a host.
+     * ntp1.ntsc.ac.cn is deliberately absent: it has no DNS record at all
+     * (verified on device 2026-11-12: ntp.ntsc.ac.cn resolves, ntp1 does not),
+     * and the official NTSC announcement only ever published ntp.ntsc.ac.cn.
+     * ntp2/ntp3 are kept for now, unverified; a dead name only costs one fast
+     * DNS failure and can no longer kill the whole query.
+     */
     static final String[] NTSC_HOSTS = {
         "ntp.ntsc.ac.cn",
-        "ntp1.ntsc.ac.cn",
         "ntp2.ntsc.ac.cn",
         "ntp3.ntsc.ac.cn",
     };
+    /**
+     * NTSC official IP (published alongside ntp.ntsc.ac.cn). Used only when
+     * at least one NTSC domain failed DNS: with DNS broken, resolving any
+     * name is hopeless, but a literal IP needs no DNS at all. Never tried
+     * when every name resolved but the server simply did not answer — the IP
+     * is the same server and would time out the same way, so the remaining
+     * budget is kept for the pool fallback instead.
+     */
+    static final String NTSC_DIRECT_IP = "210.72.145.44";
     /** Fallback when every NTSC host is unreachable. Not an NTSC source. */
     static final String FALLBACK_HOST = "cn.pool.ntp.org";
 
@@ -75,6 +91,12 @@ final class NtscNtpClient {
         final String server;
         /** True when the answering host is the pool fallback, not NTSC. */
         final boolean fallback;
+        /**
+         * True when the answer came from the NTSC direct-IP fallback
+         * ({@link #NTSC_DIRECT_IP}). The server field then holds the IP, and
+         * the UI must say "NTSC IP direct" rather than imply a name resolved.
+         */
+        final boolean directIp;
         /** Median offset: server time minus phone time, in ms. Positive = phone lags. */
         final long offsetMillis;
         /** Uncertainty budget: median round-trip delay / 2, in ms. */
@@ -92,13 +114,15 @@ final class NtscNtpClient {
         /** Most recent successful result, if any and still within max age. */
         final Result lastGood;
 
-        Result(boolean success, String server, boolean fallback, long offsetMillis,
+        Result(boolean success, String server, boolean fallback, boolean directIp,
+                long offsetMillis,
                 long uncertaintyMillis, long medianRttMillis, int sampleCount,
                 int samplesAttempted, long queryElapsedRealtimeMillis, String error,
                 Result lastGood) {
             this.success = success;
             this.server = server;
             this.fallback = fallback;
+            this.directIp = directIp;
             this.offsetMillis = offsetMillis;
             this.uncertaintyMillis = uncertaintyMillis;
             this.medianRttMillis = medianRttMillis;
@@ -149,23 +173,29 @@ final class NtscNtpClient {
         return fresh;
     }
 
+    /**
+     * Tries, in order: the NTSC domains, the NTSC direct IP (only when at
+     * least one domain failed DNS), then the pool fallback. A per-host
+     * failure never aborts the query: DNS failure, timeout, and too-few-samples
+     * are recorded per host and the next host is tried. Only when every name
+     * failed DNS does the result say so; a timeout is never reported as a
+     * DNS failure.
+     */
     private static Result queryFresh() {
         long deadlineElapsed = SystemClock.elapsedRealtime() + QUERY_DEADLINE_MILLIS;
         String lastError = "未知错误";
-        String[] hosts = new String[NTSC_HOSTS.length + 1];
-        System.arraycopy(NTSC_HOSTS, 0, hosts, 0, NTSC_HOSTS.length);
-        hosts[NTSC_HOSTS.length] = FALLBACK_HOST;
-        for (int i = 0; i < hosts.length; i++) {
-            String host = hosts[i];
-            boolean fallback = i == NTSC_HOSTS.length;
+        int dnsFailures = 0;
+        for (String host : NTSC_HOSTS) {
             try {
-                Result result = queryServer(host, fallback, deadlineElapsed);
+                Result result = queryServer(host, false, false, deadlineElapsed);
                 if (result != null) return result;
                 lastError = "服务器 " + host + " 有效样本不足 3 个";
             } catch (UnknownHostException e) {
-                // DNS is broken for every host alike; do not burn the deadline
-                // trying the remaining names one by one.
-                return failure("DNS 解析失败（" + host + "），请检查网络");
+                // One dead name must not kill the whole query: ntp1.ntsc.ac.cn
+                // has no DNS record at all, while the other names may resolve
+                // fine. Record it and try the next host.
+                dnsFailures++;
+                lastError = "服务器 " + host + " DNS 解析失败";
             } catch (SocketTimeoutException e) {
                 lastError = "服务器 " + host + " 超时无响应";
             } catch (Exception e) {
@@ -176,6 +206,44 @@ final class NtscNtpClient {
                     + " 秒），" + lastError);
             }
         }
+        // Direct-IP fallback. A literal IP needs no DNS, so it is the one
+        // thing that can still work when name resolution is broken. It is
+        // only attempted when DNS actually failed somewhere above: when every
+        // name resolved but the server never answered, the IP is the same
+        // server and would time out the same way.
+        if (dnsFailures > 0 && SystemClock.elapsedRealtime() < deadlineElapsed) {
+            try {
+                Result result = queryServer(NTSC_DIRECT_IP, false, true, deadlineElapsed);
+                if (result != null) return result;
+                lastError = "授时中心 IP 直连 " + NTSC_DIRECT_IP + " 有效样本不足 3 个";
+            } catch (UnknownHostException e) {
+                // A literal IP never needs DNS; treat it as unreachable.
+                lastError = "授时中心 IP 直连 " + NTSC_DIRECT_IP + " 无法访问";
+            } catch (SocketTimeoutException e) {
+                lastError = "授时中心 IP 直连 " + NTSC_DIRECT_IP + " 超时无响应";
+            } catch (Exception e) {
+                lastError = "授时中心 IP 直连 " + NTSC_DIRECT_IP + " 查询失败：" + e.getMessage();
+            }
+            if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
+                return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
+                    + " 秒），" + lastError);
+            }
+        }
+        try {
+            Result result = queryServer(FALLBACK_HOST, true, false, deadlineElapsed);
+            if (result != null) return result;
+            lastError = "服务器 " + FALLBACK_HOST + " 有效样本不足 3 个";
+        } catch (UnknownHostException e) {
+            dnsFailures++;
+            lastError = "服务器 " + FALLBACK_HOST + " DNS 解析失败";
+        } catch (SocketTimeoutException e) {
+            lastError = "服务器 " + FALLBACK_HOST + " 超时无响应";
+        } catch (Exception e) {
+            lastError = "服务器 " + FALLBACK_HOST + " 查询失败：" + e.getMessage();
+        }
+        if (dnsFailures == NTSC_HOSTS.length + 1) {
+            return failure("DNS 解析失败：全部服务器域名均无法解析，请检查网络");
+        }
         return failure("全部服务器无有效响应；" + lastError);
     }
 
@@ -184,9 +252,12 @@ final class NtscNtpClient {
      * successful result, or null when this host cannot produce enough valid
      * samples (the caller then tries the next host). Throws
      * {@link UnknownHostException} / {@link SocketTimeoutException} so the
-     * caller can tell DNS failure apart from plain timeouts.
+     * caller can tell DNS failure apart from plain timeouts. {@code host} may
+     * be a domain or a literal IP; the sampling, median, and validation logic
+     * is identical either way.
      */
-    private static Result queryServer(String host, boolean fallback, long deadlineElapsed)
+    private static Result queryServer(String host, boolean fallback, boolean directIp,
+            long deadlineElapsed)
             throws Exception {
         InetAddress address = InetAddress.getByName(host);
         List<Sample> valid = new ArrayList<>();
@@ -212,7 +283,7 @@ final class NtscNtpClient {
         List<Sample> kept = valid.subList(0, keep);
         double medianOffset = medianOffset(kept);
         long medianRtt = medianRtt(kept);
-        return new Result(true, host, fallback, Math.round(medianOffset),
+        return new Result(true, host, fallback, directIp, Math.round(medianOffset),
             Math.max(0L, medianRtt / 2), medianRtt, kept.size(), attempted,
             SystemClock.elapsedRealtime(), null, null);
     }
@@ -275,7 +346,7 @@ final class NtscNtpClient {
                 lastGood = cachedResult;
             }
         }
-        return new Result(false, null, false, 0, -1, -1, 0, 0,
+        return new Result(false, null, false, false, 0, -1, -1, 0, 0,
             SystemClock.elapsedRealtime(), error, lastGood);
     }
 

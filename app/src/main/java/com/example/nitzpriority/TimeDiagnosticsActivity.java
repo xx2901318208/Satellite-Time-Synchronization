@@ -886,6 +886,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         } else {
             log.append("成功：命中 ").append(ntsc.server);
             if (ntsc.fallback) log.append("（已回落到 cn.pool.ntp.org，非授时中心直连）");
+            if (ntsc.directIp) log.append("（授时中心 IP 直连）");
             log.append("\n偏移：").append(ntsc.offsetMillis)
                 .append("ms（正值=本机落后），不确定度 ±").append(ntsc.uncertaintyMillis)
                 .append("ms；往返延迟中位 ").append(ntsc.medianRttMillis)
@@ -1352,6 +1353,9 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append(escape(result.server));
         if (result.fallback) {
             html.append("（授时中心全部无响应，已回落到 cn.pool.ntp.org，非授时中心直连）");
+        }
+        if (result.directIp) {
+            html.append("（授时中心 IP 直连，域名解析失败时使用）");
         }
         html.append("；参考时刻：")
             .append(escape(formatReferenceTime(
