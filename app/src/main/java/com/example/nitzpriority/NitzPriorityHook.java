@@ -19,6 +19,27 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
     private static final int ORIGIN_NETWORK = 3;
     private static final int ORIGIN_GNSS = 4;
     static final int AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS = 1000;
+    // Per-origin automatic clock-update thresholds (ms). AOSP's
+    // mSystemClockUpdateThresholdMillis is a single global value with no
+    // per-origin field, so these are applied in the decision hook
+    // (hookThresholdDecisionPath), keyed by which suggestion's UnixEpochTime is
+    // actually being decided on. The global value above stays as the fallback
+    // for unknown origins and stale GNSS suggestions, and remains user-tunable
+    // via debug.nitz.clock_threshold_config.
+    //
+    // Rationale for the fixed values: GNSS 10 ms is aggressive and only valid
+    // for a fresh sample (see thresholdForOrigin); NTP 50 ms is the realistic
+    // floor for public-network round-trip asymmetry; NITZ 2000 ms because NITZ
+    // is whole-second quantised and must never drive fine adjustment.
+    //
+    // Trade-off, stated plainly: a 10 ms GNSS threshold means GNSS sample
+    // jitter will cause more frequent small step adjustments than a 1000 ms
+    // threshold did. That is the price of millisecond-level accuracy the user
+    // explicitly asked for. If real-device testing shows the clock stepping
+    // too often, roll GNSS back to 20 ms here (one constant, no other change).
+    static final int GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS = 10;
+    static final int NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS = 50;
+    static final int TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS = 2_000;
     static final String THRESHOLD_STATUS_PROPERTY = "debug.nitz.clock_threshold";
     static final String THRESHOLD_CONFIG_PROPERTY = "debug.nitz.clock_threshold_config";
     static final int MIN_CLOCK_UPDATE_THRESHOLD_MILLIS = 100;
@@ -27,7 +48,24 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
     // 10 minutes matches the diagnostics page's "recent GNSS sample" window.
     private static final long GNSS_SUGGESTION_MAX_AGE_MILLIS = 10L * 60 * 1000;
     private static volatile long lastGnssSuggestionElapsedMillis = -1;
+    // Latest suggestion (UnixEpochTime elapsedRealtimeMillis) seen per origin, so
+    // the decision hook can identify which origin's time is being decided on by
+    // matching the UnixEpochTime it receives. Only the latest value per origin is
+    // kept: within one origin AOSP always decides on its newest suggestion, so an
+    // older value failing to match is fail-closed (falls back to the global value).
+    private static volatile long lastTelephonySuggestionElapsedMillis = -1;
+    private static volatile long lastNetworkSuggestionElapsedMillis = -1;
     private static volatile boolean gnssStaleFallbackLogged;
+    // Effective threshold for the decision currently running on this thread.
+    // setSystemClockAndConfidenceUnderWakeLock reads the threshold through
+    // getSystemClockUpdateThresholdMillis(), so the getter hook must return the
+    // same per-origin value inside a decision and the global value outside one.
+    // Set in the decision hook's beforeHookedMethod, cleared in its
+    // afterHookedMethod (which Xposed also runs when the method throws).
+    private static final ThreadLocal<Integer> decisionThresholdOverride =
+        new ThreadLocal<>();
+    private static volatile int lastLoggedDecisionOrigin = -2;
+    private static volatile int lastLoggedDecisionThreshold = -1;
 
     private final NitzSampleMonitor sampleMonitor = new NitzSampleMonitor();
     private final GnssTriggerBridge gnssTriggerBridge = new GnssTriggerBridge();
@@ -49,6 +87,7 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
         hookThresholdDecisionPath(lpparam);
         hookTelephonySamples(lpparam);
         hookGnssSuggestions(lpparam);
+        hookNetworkSuggestions(lpparam);
         XposedBridge.log(TAG + ": loaded in android process; gnssRuntimeEnabled="
             + gnssRuntimeEnabled);
     }
@@ -151,6 +190,17 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
 
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
+                        // Inside a decision, return the same per-origin threshold the
+                        // decision hook wrote to the field; the strategy reads the
+                        // threshold through this getter, so returning the global value
+                        // here would silently defeat the per-origin decision. Outside
+                        // a decision (dumpsys, other readers) there is no current
+                        // suggestion, so the global value is the honest answer.
+                        Integer override = decisionThresholdOverride.get();
+                        if (override != null) {
+                            param.setResult(override);
+                            return;
+                        }
                         Object result = param.getResult();
                         if (!(result instanceof Number)) return;
                         int original = ((Number) result).intValue();
@@ -220,6 +270,19 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         try {
+                            // Per-origin threshold: the time being decided on is
+                            // identified by matching its UnixEpochTime against the
+                            // latest suggestion recorded per origin. Anything that
+                            // cannot be matched (unknown origin, external/manual
+                            // suggestion, reflection failure) falls back to the
+                            // global configured value -- never to 10 ms.
+                            int configured = configuredClockUpdateThreshold(lpparam);
+                            long decisionElapsed = param.args != null && param.args.length > 0
+                                ? extractSuggestionElapsed(param.args[0]) : -1L;
+                            int origin = originForDecisionElapsed(decisionElapsed);
+                            int effective = thresholdForOrigin(origin, configured);
+                            decisionThresholdOverride.set(effective);
+                            logDecisionThreshold(origin, effective, configured);
                             Field configField = param.thisObject.getClass()
                                 .getDeclaredField("mCurrentConfigurationInternal");
                             configField.setAccessible(true);
@@ -230,26 +293,40 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                                 .getDeclaredField("mSystemClockUpdateThresholdMillis");
                             thresholdField.setAccessible(true);
                             int original = thresholdField.getInt(configuration);
-                            int configured = configuredClockUpdateThreshold(lpparam);
-                            if (original != configured) {
-                                thresholdField.setInt(configuration, configured);
+                            if (original != effective) {
+                                thresholdField.setInt(configuration, effective);
                             }
-                            int effective = thresholdField.getInt(configuration);
-                            if (effective == configured) {
+                            int observed = thresholdField.getInt(configuration);
+                            if (observed == effective) {
+                                // The status property keeps reporting the global
+                                // fallback (configured) so the diagnostics page's
+                                // "hook active" check (active == configured) stays
+                                // meaningful; the per-origin effective value is in
+                                // the Xposed log, not in this property.
                                 markThresholdApplied(lpparam, original, configured);
                                 if (!logged) {
                                     logged = true;
                                     XposedBridge.log(TAG + ": decision-path clock threshold field "
-                                        + original + " -> " + effective + " ms");
+                                        + original + " -> " + observed + " ms");
                                 }
                             } else {
                                 XposedBridge.log(TAG + ": decision-path threshold verification failed; "
-                                    + "observed=" + effective);
+                                    + "observed=" + observed);
                             }
                         } catch (Throwable t) {
                             XposedBridge.log(TAG + ": decision-path threshold adjustment failed safely: "
                                 + t);
                         }
+                    }
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        // The override is only valid inside this decision call;
+                        // clear it so later getSystemClockUpdateThresholdMillis()
+                        // reads (dumpsys, other components) see the global value
+                        // again. Xposed runs after hooks even when the method
+                        // throws, so a decision failure cannot leak the override.
+                        decisionThresholdOverride.remove();
                     }
                 }
             );
@@ -261,6 +338,57 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": decision-path threshold hook failed safely: " + t);
         }
+    }
+
+    // Which origin's suggestion is being decided on, by matching the decision's
+    // UnixEpochTime against the latest suggestion recorded per origin. Returns -1
+    // when nothing matches: unknown origin, an external/manual suggestion, or a
+    // suggestion that arrived before this module loaded.
+    private static int originForDecisionElapsed(long decisionElapsed) {
+        if (decisionElapsed < 0) return -1;
+        if (decisionElapsed == lastGnssSuggestionElapsedMillis) return ORIGIN_GNSS;
+        if (decisionElapsed == lastNetworkSuggestionElapsedMillis) return ORIGIN_NETWORK;
+        if (decisionElapsed == lastTelephonySuggestionElapsedMillis) return ORIGIN_TELEPHONY;
+        return -1;
+    }
+
+    // Effective threshold for one decision. GNSS only gets its 10 ms threshold
+    // while its suggestion is fresh (10 minutes); a stale GNSS suggestion must
+    // not enjoy the aggressive threshold and falls back to the global value.
+    private static int thresholdForOrigin(int origin, int globalFallback) {
+        switch (origin) {
+            case ORIGIN_GNSS:
+                return isGnssSuggestionFresh()
+                    ? GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS : globalFallback;
+            case ORIGIN_NETWORK:
+                return NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS;
+            case ORIGIN_TELEPHONY:
+                return TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS;
+            default:
+                return globalFallback;
+        }
+    }
+
+    private static String originName(int origin) {
+        switch (origin) {
+            case ORIGIN_GNSS: return "gnss";
+            case ORIGIN_NETWORK: return "network";
+            case ORIGIN_TELEPHONY: return "telephony";
+            default: return "unknown";
+        }
+    }
+
+    // One Xposed log line per (origin, effective threshold) change, so the
+    // actually applied per-origin threshold is visible without spamming the log
+    // on every decision.
+    private static void logDecisionThreshold(int origin, int effective, int configured) {
+        if (origin == lastLoggedDecisionOrigin && effective == lastLoggedDecisionThreshold) {
+            return;
+        }
+        lastLoggedDecisionOrigin = origin;
+        lastLoggedDecisionThreshold = effective;
+        XposedBridge.log(TAG + ": per-origin threshold: origin=" + originName(origin)
+            + " effective=" + effective + " ms (global fallback=" + configured + " ms)");
     }
 
     private void markThresholdApplied(XC_LoadPackage.LoadPackageParam lpparam, int original,
@@ -294,6 +422,9 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                             // Diagnostics must never interfere with system_server time detection.
                             XposedBridge.log(TAG + ": sample monitor failed safely: " + t);
                         }
+                        // Record the suggestion's elapsed time so the decision hook can
+                        // recognise a telephony time being decided on (2000 ms threshold).
+                        recordSuggestionElapsed(ORIGIN_TELEPHONY, param.args[0]);
                     }
                 }
             );
@@ -315,7 +446,7 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                             ? param.args[0] : null;
                         XposedBridge.log(TAG + ": GNSS time suggestion reached time_detector: "
                             + String.valueOf(suggestion));
-                        recordGnssSuggestionElapsed(suggestion);
+                        recordSuggestionElapsed(ORIGIN_GNSS, suggestion);
                     }
                 }
             );
@@ -325,31 +456,93 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
         }
     }
 
-    // Records when the latest GNSS suggestion was taken, from its UnixEpochTime. Only a
-    // monotonically newer timestamp advances the marker, so a re-delivered old suggestion
-    // cannot extend freshness. Any reflection failure is diagnostic-only and must never
-    // interfere with system_server time detection.
-    private static void recordGnssSuggestionElapsed(Object suggestion) {
-        if (suggestion == null) return;
+    // Records network (NTP) suggestions so the decision hook can recognise a
+    // network time being decided on (50 ms threshold). Diagnostic-only: a failure
+    // here only costs the per-origin match, which falls back to the global value.
+    private void hookNetworkSuggestions(final XC_LoadPackage.LoadPackageParam lpparam) {
         try {
+            Set<?> hooks = XposedBridge.hookAllMethods(
+                findClass("com.android.server.timedetector.TimeDetectorStrategyImpl", lpparam),
+                "suggestNetworkTime",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Object suggestion = param.args != null && param.args.length > 0
+                            ? param.args[0] : null;
+                        recordSuggestionElapsed(ORIGIN_NETWORK, suggestion);
+                    }
+                }
+            );
+            XposedBridge.log(TAG + ": network suggestion monitor hooks=" + hooks.size());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": network suggestion monitor hook unavailable: " + t);
+        }
+    }
+
+    // Extracts the elapsedRealtimeMillis of a time suggestion (or a UnixEpochTime
+    // itself, which is what the decision method receives) via reflection. The
+    // exact AOSP shape varies by version and OEM, so every shape is tried and
+    // anything unrecognised returns -1, which the caller treats as "no match"
+    // and falls back to the global threshold. A bare Number is only trusted when
+    // it can actually be an elapsedRealtime value: a unix-epoch millis value
+    // simply never matches a recorded elapsed value, so it also falls back.
+    private static long extractSuggestionElapsed(Object suggestion) {
+        if (suggestion == null) return -1;
+        if (suggestion instanceof Number) return ((Number) suggestion).longValue();
+        try {
+            // UnixEpochTime itself exposes getElapsedRealtimeMillis() directly.
+            try {
+                Object elapsed = suggestion.getClass()
+                    .getMethod("getElapsedRealtimeMillis").invoke(suggestion);
+                if (elapsed instanceof Number) return ((Number) elapsed).longValue();
+            } catch (NoSuchMethodException ignored) {
+                // Not a UnixEpochTime; try the TimeSuggestion shape below.
+            }
             Object unixEpochTime = suggestion.getClass().getMethod("getUnixEpochTime")
                 .invoke(suggestion);
-            if (unixEpochTime == null) return;
-            Object elapsed = unixEpochTime.getClass().getMethod("getElapsedRealtimeMillis")
-                .invoke(unixEpochTime);
-            if (!(elapsed instanceof Number)) return;
-            long sampleElapsed = ((Number) elapsed).longValue();
-            long nowElapsed = SystemClock.elapsedRealtime();
-            // Reject non-positive or implausibly future timestamps (2s tolerance for
-            // cross-thread sampling skew); elapsedRealtime is monotonic, so a value far
-            // in the future cannot be a genuine sample.
-            if (sampleElapsed <= 0 || sampleElapsed > nowElapsed + 2_000) return;
-            if (sampleElapsed > lastGnssSuggestionElapsedMillis) {
-                lastGnssSuggestionElapsedMillis = sampleElapsed;
-                gnssStaleFallbackLogged = false;
-            }
+            if (unixEpochTime == null) return -1;
+            Object elapsed = unixEpochTime.getClass()
+                .getMethod("getElapsedRealtimeMillis").invoke(unixEpochTime);
+            if (!(elapsed instanceof Number)) return -1;
+            return ((Number) elapsed).longValue();
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": could not read GNSS suggestion elapsed time: " + t);
+            XposedBridge.log(TAG + ": could not read suggestion elapsed time: " + t);
+            return -1;
+        }
+    }
+
+    // Records when the latest suggestion of one origin was taken, from its
+    // UnixEpochTime. Only a monotonically newer timestamp advances the marker,
+    // so a re-delivered old suggestion cannot extend freshness or shadow a
+    // newer one. Any reflection failure is diagnostic-only and must never
+    // interfere with system_server time detection.
+    private static void recordSuggestionElapsed(int origin, Object suggestion) {
+        long sampleElapsed = extractSuggestionElapsed(suggestion);
+        if (sampleElapsed <= 0) return;
+        long nowElapsed = SystemClock.elapsedRealtime();
+        // Reject non-positive or implausibly future timestamps (2s tolerance for
+        // cross-thread sampling skew); elapsedRealtime is monotonic, so a value far
+        // in the future cannot be a genuine sample.
+        if (sampleElapsed > nowElapsed + 2_000) return;
+        switch (origin) {
+            case ORIGIN_GNSS:
+                if (sampleElapsed > lastGnssSuggestionElapsedMillis) {
+                    lastGnssSuggestionElapsedMillis = sampleElapsed;
+                    gnssStaleFallbackLogged = false;
+                }
+                break;
+            case ORIGIN_TELEPHONY:
+                if (sampleElapsed > lastTelephonySuggestionElapsedMillis) {
+                    lastTelephonySuggestionElapsedMillis = sampleElapsed;
+                }
+                break;
+            case ORIGIN_NETWORK:
+                if (sampleElapsed > lastNetworkSuggestionElapsedMillis) {
+                    lastNetworkSuggestionElapsedMillis = sampleElapsed;
+                }
+                break;
+            default:
+                break;
         }
     }
 

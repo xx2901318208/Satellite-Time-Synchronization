@@ -194,7 +194,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         root.addView(thresholdCard, thresholdCardParams);
 
         TextView thresholdLabel = new TextView(this);
-        thresholdLabel.setText("自动改时门槛");
+        thresholdLabel.setText("自动改时门槛（全局回落值）");
         thresholdLabel.setTextSize(14);
         thresholdLabel.setTypeface(null, android.graphics.Typeface.BOLD);
         thresholdLabel.setTextColor(Color.rgb(37, 48, 66));
@@ -208,7 +208,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         thresholdInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         thresholdInput.setTextSize(18);
         thresholdInput.setMinHeight(dp(48));
-        thresholdInput.setHint("1–2000");
+        thresholdInput.setHint("100–2000");
         thresholdInput.setText(String.valueOf(getSharedPreferences("settings", MODE_PRIVATE)
             .getInt("threshold_ms", NitzPriorityHook.AUTO_CLOCK_UPDATE_THRESHOLD_MILLIS)));
         thresholdRow.addView(thresholdInput, new LinearLayout.LayoutParams(0, -2, 1));
@@ -221,7 +221,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         thresholdCard.addView(thresholdRow, new LinearLayout.LayoutParams(-1, -2));
 
         TextView thresholdHint = new TextView(this);
-        thresholdHint.setText("单位：毫秒（1–2000）。门槛只决定系统是否跳时，不会提高授时样本本身的精度。");
+        thresholdHint.setText("单位：毫秒（100–2000）。这里改的是全局回落值，仅用于未知来源与不新鲜的 GNSS 建议；GNSS 10ms、网络 50ms、基站 2000ms 各有自己的门槛。门槛只决定系统是否跳时，不会提高授时样本本身的精度。");
         thresholdHint.setTextSize(12);
         thresholdHint.setTextColor(Color.rgb(104, 117, 138));
         thresholdHint.setPadding(dp(4), dp(4), dp(4), dp(2));
@@ -391,12 +391,12 @@ public final class TimeDiagnosticsActivity extends Activity {
         try {
             threshold = Integer.parseInt(thresholdInput.getText().toString().trim());
         } catch (NumberFormatException e) {
-            Toast.makeText(this, "请输入 1–2000 之间的毫秒数", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "请输入 100–2000 之间的毫秒数", Toast.LENGTH_LONG).show();
             return;
         }
         if (threshold < NitzPriorityHook.MIN_CLOCK_UPDATE_THRESHOLD_MILLIS
                 || threshold > NitzPriorityHook.MAX_CLOCK_UPDATE_THRESHOLD_MILLIS) {
-            Toast.makeText(this, "门槛范围为 1–2000 毫秒", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "门槛范围为 100–2000 毫秒", Toast.LENGTH_LONG).show();
             return;
         }
 
@@ -414,7 +414,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             runOnUiThread(() -> {
                 applyThresholdButton.setEnabled(currentDiagnosticsHasRoot);
                 Toast.makeText(this, success
-                        ? "门槛已设为 " + threshold + " ms；system_server 将在后续授时决策时应用"
+                        ? "全局回落门槛已设为 " + threshold + " ms；GNSS 10ms / 网络 50ms / 基站 2000ms 不变，system_server 将在后续授时决策时应用"
                         : "设置失败，请检查 Root 授权与系统属性权限",
                     Toast.LENGTH_LONG).show();
                 refresh();
@@ -575,7 +575,6 @@ public final class TimeDiagnosticsActivity extends Activity {
             && thresholdStatusParts.length == 2;
         long deviceOriginalThreshold = thresholdHookActive
             ? parseLongValue(thresholdStatusParts[1], dumpedThreshold) : dumpedThreshold;
-        long threshold = configuredThreshold;
         String autoEnabled = parseString(AUTO_ENABLED_PATTERN, timeDump, "unknown");
         String priorities = parseString(PRIORITIES_PATTERN, timeDump, "unknown");
         Sample gnss = findLatestSample(timeDump, "GnssTimeSuggestion");
@@ -628,21 +627,34 @@ public final class TimeDiagnosticsActivity extends Activity {
         html.append("<div class='card'><div class='summary'>自动授时：<b>")
             .append(escape(autoEnabled)).append("</b>　优先级：<b>")
             .append(escape(priorities)).append("</b></div>")
-            .append("<div class='threshold'>自动改时门槛 <b>").append(threshold)
+            // Per-origin thresholds: a single number would lie now, because the
+            // decision hook applies GNSS 10 ms / network 50 ms / telephony 2000 ms
+            // and only falls back to the configured global value for unknown
+            // origins and stale GNSS suggestions.
+            .append("<div class='threshold'>自动改时门槛（分来源）：GNSS <b>")
+            .append(NitzPriorityHook.GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS)
+            .append(" ms</b> · 网络 <b>")
+            .append(NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS)
+            .append(" ms</b> · 基站 <b>")
+            .append(NitzPriorityHook.TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS)
             .append(" ms</b>");
         if (thresholdHookActive) {
-            html.append("（模块已命中；设备原值 ").append(deviceOriginalThreshold).append(" ms）");
+            html.append("（模块已命中；全局回落值 ").append(configuredThreshold)
+                .append(" ms，设备原值 ").append(deviceOriginalThreshold).append(" ms）");
         } else {
             html.append("（模块设定值；system_server 生效待确认；dump 当前值 ")
                 .append(dumpedThreshold).append(" ms）");
         }
         html.append(" · 当前时钟 ").append(systemUnix).append(" ms</div>")
-            .append(sourceCard("GNSS 卫星", gnssDisplay, nowElapsed, systemUnix, threshold,
+            .append(sourceCard("GNSS 卫星", gnssDisplay, nowElapsed, systemUnix,
+                NitzPriorityHook.GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS,
                 gnssService == null ? null : nowElapsed - gnssService.elapsedRealtimeMillis,
                 gnssUncertainty, null))
-            .append(sourceCard("基站 NITZ", telephonyDisplay, nowElapsed, systemUnix, threshold,
+            .append(sourceCard("基站 NITZ", telephonyDisplay, nowElapsed, systemUnix,
+                NitzPriorityHook.TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS,
                 null, telephonyUncertainty, telephonySlotNote))
-            .append(sourceCard("网络 NTP", networkDisplay, nowElapsed, systemUnix, threshold,
+            .append(sourceCard("网络 NTP", networkDisplay, nowElapsed, systemUnix,
+                NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS,
                 null, networkTotalUncertainty, null));
 
         html.append("</div>")
