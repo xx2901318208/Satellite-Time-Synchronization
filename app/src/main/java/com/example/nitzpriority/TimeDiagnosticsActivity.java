@@ -600,16 +600,20 @@ public final class TimeDiagnosticsActivity extends Activity {
             }
             // Keep this refresh for the copy-log button: it reuses exactly
             // these dumps and results instead of running dumpsys a second time.
+            // The raw GnssClock sample is read here too, so the page and the
+            // log show the same raw reading from this refresh.
+            GnssLocationTrackingService.RawGnssSample rawGnss =
+                GnssLocationTrackingService.readRawSample(this);
             lastDiagnosticSnapshot = new DiagnosticSnapshot(hasRoot, identity,
                 timeDump, gnssDump, thresholdStatus, thresholdConfig,
                 nitzCalibrationStatus, calibrationState, calibrationDetail,
                 calibrationTime, calibrationStartElapsed, forceState, forceDetail,
-                forceTime, trendPoints, ntscResult,
+                forceTime, trendPoints, ntscResult, rawGnss,
                 System.currentTimeMillis(), SystemClock.elapsedRealtime());
             String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
                 calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
                 forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
-                nitzCalibrationStatus, trendPoints, ntscResult);
+                nitzCalibrationStatus, trendPoints, ntscResult, rawGnss);
             runOnUiThread(() -> {
                 refreshInProgress = false;
                 setRefreshing(false);
@@ -810,6 +814,37 @@ public final class TimeDiagnosticsActivity extends Activity {
                     Math.max(0L, nowElapsed - gnssService.elapsedRealtimeMillis)))
                 .append("前）\n");
         }
+        log.append("原始 GNSS 时钟：");
+        if (s.rawGnss == null || !s.rawGnss.available) {
+            log.append("尚无原始测量记录\n");
+        } else if (!s.rawGnss.utcAvailable || s.rawGnss.offsetMillis == Long.MIN_VALUE) {
+            log.append("已有原始测量，无法换算 UTC 偏差");
+            if (s.rawGnss.discardReason != null && !s.rawGnss.discardReason.isEmpty()) {
+                log.append("（原因：").append(s.rawGnss.discardReason).append("）");
+            }
+            log.append("\n");
+        } else if (s.rawGnss.ageMillis(nowElapsed) < 0 || systemUnix < 0) {
+            log.append("样本参考时间无效\n");
+        } else {
+            long rawAge = s.rawGnss.ageMillis(nowElapsed);
+            long rawOffset = s.rawGnss.gnssUtcMillis + rawAge - systemUnix;
+            log.append("偏移=").append(rawOffset).append("ms（正值=本机落后），不确定度 ±")
+                .append(s.rawGnss.uncertaintyMillis + driftBudgetMillis(rawAge))
+                .append("ms（").append(s.rawGnss.uncertaintyEstimated
+                    ? "芯片未上报有效值，按保守预算 ±"
+                        + GnssLocationTrackingService.RAW_UNCERTAINTY_FALLBACK_MILLIS + " ms 计"
+                    : "芯片上报")
+                .append(" + 年龄漂移预算），样本 ")
+                .append(formatAge(rawAge)).append("前");
+            if (s.rawGnss.visibleSatellites >= 0 && s.rawGnss.usedSatellites >= 0
+                    && s.rawGnss.satelliteStatusElapsedMillis > 0
+                    && Math.abs(s.rawGnss.satelliteStatusElapsedMillis
+                        - s.rawGnss.sampleElapsedMillis) <= 60_000L) {
+                log.append("，可见 ").append(s.rawGnss.visibleSatellites)
+                    .append(" 颗/参与定位 ").append(s.rawGnss.usedSatellites).append(" 颗");
+            }
+            log.append("（后备来源，不参与“已与卫星时间同步”判定）\n");
+        }
         log.append("基站校准：")
             .append(nitzCalibration == null ? "未发布校准状态"
                 : nitzCalibration.displayText())
@@ -960,7 +995,8 @@ public final class TimeDiagnosticsActivity extends Activity {
             String forceState, String forceDetail, long forceTime, String thresholdStatus,
             String thresholdConfig, String nitzCalibrationStatus,
             List<TrendPoint> trendPoints,
-            NtscNtpClient.Result ntscResult) {
+            NtscNtpClient.Result ntscResult,
+            GnssLocationTrackingService.RawGnssSample rawGnss) {
         currentDiagnosticsHasRoot = hasRoot;
         currentForceOptions = new ForceOption[0];
         StringBuilder html = new StringBuilder(8_000);
@@ -1020,6 +1056,10 @@ public final class TimeDiagnosticsActivity extends Activity {
                 .append("<div class='meta'>请在 Magisk / SuperSU 中允许“卫星对时”获取 root，然后点“刷新”。</div>")
                 .append("<div class='small'>检查结果：").append(escape(identity.trim().isEmpty()
                     ? "su 命令失败或未授权" : identity.trim())).append("</div></div>")
+                // The raw GnssClock reading needs location, not root, so it
+                // is shown on the no-root page too.
+                .append(rawGnssSourceCard(rawGnss, SystemClock.elapsedRealtime(),
+                    System.currentTimeMillis()))
                 .append(calibrationCard(calibrationState, calibrationDetail, calibrationTime))
                 .append(forceCard(forceState, forceDetail, forceTime))
                 .append(ntscTimeCard(ntscResult))
@@ -1054,6 +1094,20 @@ public final class TimeDiagnosticsActivity extends Activity {
         addForceOption(options, "基站 NITZ", telephony, nowElapsed, systemUnix, -1);
         addForceOption(options, "网络 NTP", network, nowElapsed, systemUnix,
             networkUncertainty);
+        // Raw GnssClock as a fallback force source. Same guardrails as the
+        // system sources: the sample must be within 10 minutes, the jump is
+        // capped at 60 s, and the one-time token / double confirmation /
+        // post-jump clock re-check all apply unchanged. System suggestions
+        // stay first in the list; the raw option only appears when a fresh,
+        // valid raw measurement exists.
+        if (rawGnss != null && rawGnss.utcAvailable
+                && rawGnss.offsetMillis != Long.MIN_VALUE
+                && rawGnss.sampleElapsedMillis >= 0 && rawGnss.gnssUtcMillis > 0) {
+            addForceOption(options, "原始 GNSS 时钟",
+                new Sample(rawGnss.sampleElapsedMillis, rawGnss.gnssUtcMillis),
+                nowElapsed, systemUnix, rawGnss.uncertaintyMillis,
+                rawGnss.uncertaintyEstimated);
+        }
         currentForceOptions = options.toArray(new ForceOption[0]);
         // Display uses the median-resolved samples (outlier-resistant); force-jump
         // options above intentionally keep the latest sample and are untouched here.
@@ -1137,7 +1191,8 @@ public final class TimeDiagnosticsActivity extends Activity {
                 null, telephonyUncertainty, telephonySlotNote))
             .append(sourceCard("网络 NTP", networkDisplay, nowElapsed, systemUnix,
                 NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS,
-                null, networkTotalUncertainty, null));
+                null, networkTotalUncertainty, null))
+            .append(rawGnssSourceCard(rawGnss, nowElapsed, systemUnix));
 
         html.append("</div>")
             .append(clockActionCard(timeDump, nowElapsed))
@@ -1417,6 +1472,9 @@ public final class TimeDiagnosticsActivity extends Activity {
         }
         if ("SUCCESS".equals(calibrationState)) {
             return "否（本次收到 GNSS 建议，但未记录到本次实际跳时；可能已足够接近而无需调整）";
+        }
+        if ("SUCCESS_RAW".equals(calibrationState)) {
+            return "未改时（本次以原始 GnssClock 偏移完成校准，仅测得手机与 GNSS 的偏差，未由系统实际改时）";
         }
         return "未发现本次操作后的 GNSS 实际改时记录";
     }
@@ -1721,6 +1779,9 @@ public final class TimeDiagnosticsActivity extends Activity {
         if ("SUCCESS".equals(state)) {
             label = "本次已收到新的 GNSS 建议";
             css = "good";
+        } else if ("SUCCESS_RAW".equals(state)) {
+            label = "已用原始 GNSS 时钟完成校准";
+            css = "good";
         } else if ("RUNNING".equals(state)) {
             label = "正在校准 · 等待 GNSS 样本";
             css = "running";
@@ -1800,13 +1861,23 @@ public final class TimeDiagnosticsActivity extends Activity {
 
     private static void addForceOption(List<ForceOption> options, String name, Sample sample,
             long nowElapsed, long systemUnix, long uncertainty) {
+        addForceOption(options, name, sample, nowElapsed, systemUnix, uncertainty, false);
+    }
+
+    private static void addForceOption(List<ForceOption> options, String name, Sample sample,
+            long nowElapsed, long systemUnix, long uncertainty,
+            boolean uncertaintyEstimated) {
         if (sample == null || nowElapsed < sample.elapsedRealtimeMillis || systemUnix < 0) return;
-        long age = nowElapsed - sample.elapsedRealtimeMillis;
+        // A raw sample read after the dumpsys snapshot can be a few seconds
+        // newer than the dump's own elapsed clock; a negative age would only
+        // produce a "reference time invalid" label in the chooser, so clamp
+        // it — the drift over that gap is inside the uncertainty budget.
+        long age = Math.max(0L, nowElapsed - sample.elapsedRealtimeMillis);
         if (age > maxForceSampleAgeMillis(name)) return;
         long target = sample.unixEpochTimeMillis + age;
         if (target < 1_577_836_800_000L || target > 4_102_444_800_000L) return;
         options.add(new ForceOption(name, target, target - systemUnix, age, uncertainty,
-            nowElapsed));
+            nowElapsed, uncertaintyEstimated));
     }
 
     private static long maxForceSampleAgeMillis(String source) {
@@ -1863,6 +1934,9 @@ public final class TimeDiagnosticsActivity extends Activity {
         message.append("目标不确定度：±").append(String.valueOf(uncertainty)).append(" ms");
         if ("基站 NITZ".equals(option.source)) {
             message.append("（基站 NITZ 基线 ±1500 ms，样本越老不确定度越大）");
+        } else if (option.uncertaintyEstimated) {
+            message.append("（保守预算 ±").append(String.valueOf(option.uncertaintyMillis))
+                .append(" ms；芯片未上报有效不确定度，样本越老不确定度越大）");
         } else if (option.uncertaintyMillis >= 0) {
             message.append("（来源上报 ±").append(String.valueOf(option.uncertaintyMillis))
                 .append(" ms，样本越老不确定度越大）");
@@ -1895,7 +1969,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         if (options == null || options.length == 0) {
             new AlertDialog.Builder(this)
                 .setTitle("没有可用的时间源")
-                .setMessage("没有符合年龄限制的授时样本。GNSS、基站 NITZ 和网络 NTP 样本均需在 10 分钟内。请刷新或先获取新的 GNSS 样本。")
+                .setMessage("没有符合年龄限制的授时样本。GNSS、基站 NITZ、网络 NTP 与原始 GNSS 时钟样本均需在 10 分钟内。请刷新或先获取新的 GNSS 样本。")
                 .setPositiveButton("知道了", null)
                 .show();
             return;
@@ -1966,7 +2040,8 @@ public final class TimeDiagnosticsActivity extends Activity {
         long elapsedDelta = Math.max(0, nowElapsed - option.diagnosticElapsedMillis);
         long target = option.targetUnixMillis + elapsedDelta;
         return new ForceOption(option.source, target, target - System.currentTimeMillis(),
-            option.ageMillis + elapsedDelta, option.uncertaintyMillis, nowElapsed);
+            option.ageMillis + elapsedDelta, option.uncertaintyMillis, nowElapsed,
+            option.uncertaintyEstimated);
     }
 
     private void confirmForceJump(ForceOption inputOption) {
@@ -2097,6 +2172,87 @@ public final class TimeDiagnosticsActivity extends Activity {
             Locale.CHINA);
         format.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
         return format.format(new Date(timeMillis));
+    }
+
+    /**
+     * The raw GnssClock as a formal, fallback time source. It is measured
+     * directly by the app's own GPS listener (same store the calibration
+     * page reads) and never needs root or the system GnssTimeUpdateService.
+     * It is display-only for the "phone clock is in sync with satellite
+     * time" judgment: that judgment still reads the system GNSS suggestion
+     * only (see gnssSyncCard). When no system suggestion exists, the same
+     * reading backs manual calibration and the force-jump option.
+     */
+    private static String rawGnssSourceCard(
+            GnssLocationTrackingService.RawGnssSample raw, long nowElapsed,
+            long systemUnix) {
+        StringBuilder card = new StringBuilder("<div class='source'><div><div class='name'>")
+            .append("原始 GNSS 时钟</div>");
+        if (raw == null || !raw.available) {
+            card.append("<div class='meta'>尚无原始测量记录</div>")
+                .append("<div class='small'>需开启定位后由校准页或定期同步采集；")
+                .append("系统建议优先，原始时钟只作后备。</div>")
+                .append("</div><div class='value none'>暂无</div></div>");
+            return card.toString();
+        }
+        long age = raw.ageMillis(nowElapsed);
+        if (!raw.utcAvailable || raw.offsetMillis == Long.MIN_VALUE) {
+            card.append("<div class='meta'>已有原始测量，无法换算 UTC 偏差</div>");
+            if (raw.discardReason != null && !raw.discardReason.isEmpty()) {
+                card.append("<div class='small'>原因：")
+                    .append(escape(raw.discardReason)).append("</div>");
+            }
+            card.append("<div class='small'>系统建议优先；原始时钟只作后备。</div>")
+                .append("</div><div class='value none'>暂无</div></div>");
+            return card.toString();
+        }
+        if (age < 0 || systemUnix < 0) {
+            card.append("<div class='meta'>样本参考时间无效</div></div>")
+                .append("<div class='value none'>—</div></div>");
+            return card.toString();
+        }
+        // Same projection as the other source cards: the GNSS UTC at the
+        // sample instant, extrapolated to now, compared with the phone clock.
+        long projected = raw.gnssUtcMillis + age;
+        long offset = projected - systemUnix;
+        long uncertainty = raw.uncertaintyMillis + driftBudgetMillis(age);
+        String valueClass = offset < 0 ? "lead" : offset > 0 ? "lag" : "equal";
+        card.append("<div class='meta'>原始测量 · 样本 ")
+            .append(escape(formatAge(age))).append("前</div>");
+        if (raw.visibleSatellites >= 0 && raw.usedSatellites >= 0
+                && raw.satelliteStatusElapsedMillis > 0
+                && Math.abs(raw.satelliteStatusElapsedMillis
+                    - raw.sampleElapsedMillis) <= 60_000L) {
+            card.append("<div class='small'>可见 ").append(raw.visibleSatellites)
+                .append(" 颗 · 参与定位 ").append(raw.usedSatellites).append(" 颗</div>");
+        }
+        card.append("<div class='small'>不确定度 ±").append(uncertainty)
+            .append(" ms（").append(raw.uncertaintyEstimated
+                ? "芯片未上报有效值，按保守预算 ±"
+                    + GnssLocationTrackingService.RAW_UNCERTAINTY_FALLBACK_MILLIS
+                    + " ms 计" : "芯片上报")
+            .append(" + 年龄漂移预算）</div>")
+            .append("<div class='small'>后备来源：系统建议优先；无系统建议时用于校准与强制跳改。</div>");
+        if (age > DISPLAY_STALE_AGE_MILLIS) {
+            // Over an hour old: the extrapolated value is not trustworthy enough to
+            // show as a millisecond number at all.
+            card.append("</div><div style='text-align:right'><div class='value none'>样本过旧</div>")
+                .append("<div class='pill'>请重新采样</div></div></div>")
+                .append("<div class='divider'></div>");
+            return card.toString();
+        }
+        card.append("</div><div style='text-align:right'><div class='value ")
+            .append(valueClass).append("'>").append(Math.abs(offset)).append(" 毫秒")
+            .append(" ±").append(uncertainty).append(" 毫秒</div>")
+            .append("<div class='pill ").append(valueClass).append("'>")
+            .append(escape(phoneRelationLabel("原始 GNSS 时钟", offset)))
+            .append("</div>");
+        if (age > DISPLAY_REFERENCE_MAX_AGE_MILLIS) {
+            card.append("<div class='pill'>样本超 10 分钟，仅供参考</div>");
+        }
+        card.append("</div></div>")
+            .append("<div class='divider'></div>");
+        return card.toString();
     }
 
     private static String sourceCard(String name, Sample sample, long nowElapsed, long systemUnix,
@@ -2529,6 +2685,7 @@ public final class TimeDiagnosticsActivity extends Activity {
 
     private static String sourceTimeName(String source) {
         if ("GNSS 卫星".equals(source)) return "卫星时间";
+        if ("原始 GNSS 时钟".equals(source)) return "GNSS 时间";
         if ("基站 NITZ".equals(source)) return "基站时间";
         if ("网络 NTP".equals(source)) return "网络时间";
         return source + "时间";
@@ -2616,6 +2773,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         final long forceTime;
         final List<TrendPoint> trendPoints;
         final NtscNtpClient.Result ntscResult;
+        final GnssLocationTrackingService.RawGnssSample rawGnss;
         final long collectedWallMillis;
         final long collectedElapsedMillis;
 
@@ -2625,7 +2783,9 @@ public final class TimeDiagnosticsActivity extends Activity {
                 String calibrationDetail, long calibrationTime,
                 long calibrationStartElapsed, String forceState, String forceDetail,
                 long forceTime, List<TrendPoint> trendPoints,
-                NtscNtpClient.Result ntscResult, long collectedWallMillis,
+                NtscNtpClient.Result ntscResult,
+                GnssLocationTrackingService.RawGnssSample rawGnss,
+                long collectedWallMillis,
                 long collectedElapsedMillis) {
             this.hasRoot = hasRoot;
             this.identity = identity;
@@ -2643,6 +2803,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             this.forceTime = forceTime;
             this.trendPoints = trendPoints;
             this.ntscResult = ntscResult;
+            this.rawGnss = rawGnss;
             this.collectedWallMillis = collectedWallMillis;
             this.collectedElapsedMillis = collectedElapsedMillis;
         }
@@ -2720,15 +2881,24 @@ public final class TimeDiagnosticsActivity extends Activity {
         final long ageMillis;
         final long uncertaintyMillis;
         final long diagnosticElapsedMillis;
+        /**
+         * True when uncertaintyMillis is the conservative fallback budget,
+         * not a value the source reported — currently only the raw GnssClock
+         * option, whose chip may report no usable uncertainty. Shown as
+         * "保守预算" in the confirmation, never as "来源上报".
+         */
+        final boolean uncertaintyEstimated;
 
         ForceOption(String source, long targetUnixMillis, long offsetMillis, long ageMillis,
-                long uncertaintyMillis, long diagnosticElapsedMillis) {
+                long uncertaintyMillis, long diagnosticElapsedMillis,
+                boolean uncertaintyEstimated) {
             this.source = source;
             this.targetUnixMillis = targetUnixMillis;
             this.offsetMillis = offsetMillis;
             this.ageMillis = ageMillis;
             this.uncertaintyMillis = uncertaintyMillis;
             this.diagnosticElapsedMillis = diagnosticElapsedMillis;
+            this.uncertaintyEstimated = uncertaintyEstimated;
         }
     }
 }

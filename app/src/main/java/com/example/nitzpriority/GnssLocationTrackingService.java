@@ -6,7 +6,9 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.location.GnssClock;
@@ -37,6 +39,21 @@ public final class GnssLocationTrackingService extends Service {
         "com.example.nitzpriority.action.PERIODIC_GNSS_BURST";
     private static final String TAG = "NitzPriority";
     private static final long BURST_TIMEOUT_MILLIS = 60_000L;
+    /**
+     * Conservative ±uncertainty (ms) of a raw GnssClock offset when the chip
+     * reports no usable time uncertainty. A chip that reports 0 (or nothing)
+     * has not measured an uncertainty at all: 0 ms would claim a perfect
+     * clock, so it is treated as unknown and replaced by this budget. The
+     * value is the codebase's own bound for a raw offset, not an arbitrary
+     * round number: the periodic-sync burst already records raw GNSS samples
+     * into the drift store with a 100 ms uncertainty, and the measurement
+     * callback itself discards any sample whose reported time uncertainty
+     * exceeds 100 ms. The offset also pairs a hardware GNSS clock with the
+     * phone wall clock across a Binder callback and a wall-clock read, so
+     * sub-millisecond precision cannot be assumed even when the chip reports
+     * a small number.
+     */
+    static final long RAW_UNCERTAINTY_FALLBACK_MILLIS = 100L;
     private static final String ACTION_STOP_BY_USER =
         "com.example.nitzpriority.action.STOP_GNSS_TRACKING_BY_USER";
     private static final String EXTRA_TOKEN = "session_token";
@@ -88,6 +105,131 @@ public final class GnssLocationTrackingService extends Service {
             startTracking();
         }
         return START_NOT_STICKY;
+    }
+
+    /**
+     * Effective ±uncertainty (ms) of one raw GnssClock offset. Uses the
+     * chip-reported time uncertainty when it is present and positive,
+     * combined in quadrature with the reported bias uncertainty when that is
+     * also present and positive; when the time uncertainty is missing or
+     * zero it is treated as unknown and replaced by
+     * {@link #RAW_UNCERTAINTY_FALLBACK_MILLIS}. Never returns 0: a zero
+     * uncertainty must not reach a sync decision or an uncertainty display.
+     */
+    static long effectiveRawUncertaintyMillis(double timeUncertaintyNanos,
+            double biasUncertaintyNanos) {
+        double timeMs = timeUncertaintyNanos / 1_000_000.0;
+        if (!(timeMs > 0)) return RAW_UNCERTAINTY_FALLBACK_MILLIS;
+        double biasMs = biasUncertaintyNanos / 1_000_000.0;
+        if (biasMs > 0) timeMs = Math.sqrt(timeMs * timeMs + biasMs * biasMs);
+        return Math.max(1L, Math.round(timeMs));
+    }
+
+    /** Latest raw GnssClock measurement, as written by this service. */
+    static final class RawGnssSample {
+        /** Any raw measurement has been received since tracking started. */
+        final boolean available;
+        /**
+         * The measurement passed every validity gate in the callback
+         * (fresh within 1 s, leap second in range, no discontinuity, time
+         * uncertainty under 100 ms, |offset| under 60 s) and was not
+         * discarded: its UTC offset is usable as a fallback time source.
+         */
+        final boolean utcAvailable;
+        /** GNSS UTC minus phone UTC at the sample instant, in ms. */
+        final long offsetMillis;
+        /** GNSS UTC at the sample instant, in ms since the Unix epoch. */
+        final long gnssUtcMillis;
+        /** Effective ±uncertainty (ms); see effectiveRawUncertaintyMillis. */
+        final long uncertaintyMillis;
+        /** True when the uncertainty is the fallback budget, not a chip value. */
+        final boolean uncertaintyEstimated;
+        /**
+         * GnssClock timestamp of the sample, in elapsedRealtime millis.
+         * Falls back to the callback receipt time when the clock carries no
+         * elapsed timestamp; -1 when neither is known.
+         */
+        final long sampleElapsedMillis;
+        final int measurementCount;
+        final int visibleSatellites;
+        final int usedSatellites;
+        final long satelliteStatusElapsedMillis;
+        final int fixCount;
+        final long lastFixElapsedMillis;
+        final String discardReason;
+
+        RawGnssSample(boolean available, boolean utcAvailable, long offsetMillis,
+                long gnssUtcMillis, long uncertaintyMillis, boolean uncertaintyEstimated,
+                long sampleElapsedMillis, int measurementCount, int visibleSatellites,
+                int usedSatellites, long satelliteStatusElapsedMillis, int fixCount,
+                long lastFixElapsedMillis, String discardReason) {
+            this.available = available;
+            this.utcAvailable = utcAvailable;
+            this.offsetMillis = offsetMillis;
+            this.gnssUtcMillis = gnssUtcMillis;
+            this.uncertaintyMillis = uncertaintyMillis;
+            this.uncertaintyEstimated = uncertaintyEstimated;
+            this.sampleElapsedMillis = sampleElapsedMillis;
+            this.measurementCount = measurementCount;
+            this.visibleSatellites = visibleSatellites;
+            this.usedSatellites = usedSatellites;
+            this.satelliteStatusElapsedMillis = satelliteStatusElapsedMillis;
+            this.fixCount = fixCount;
+            this.lastFixElapsedMillis = lastFixElapsedMillis;
+            this.discardReason = discardReason == null ? "" : discardReason;
+        }
+
+        /** Sample age at the given elapsedRealtime instant; -1 when unknown. */
+        long ageMillis(long nowElapsedMillis) {
+            if (sampleElapsedMillis < 0 || nowElapsedMillis < 0) return -1L;
+            return Math.max(0L, nowElapsedMillis - sampleElapsedMillis);
+        }
+
+        static RawGnssSample fromPrefs(SharedPreferences prefs) {
+            boolean available = prefs.getBoolean("raw_measurement_available", false);
+            boolean utcAvailable = prefs.getBoolean("raw_clock_utc_available", false)
+                && !prefs.getBoolean("raw_sample_discarded", false);
+            double offset = parseDouble(prefs.getString("raw_offset_millis", "NaN"));
+            long offsetMillis = Double.isFinite(offset) ? Math.round(offset)
+                : Long.MIN_VALUE;
+            double timeUncertaintyNanos =
+                parseDouble(prefs.getString("raw_time_uncertainty_nanos", ""));
+            double biasUncertaintyNanos =
+                parseDouble(prefs.getString("raw_bias_uncertainty_nanos", ""));
+            boolean uncertaintyEstimated = !(timeUncertaintyNanos > 0);
+            long uncertaintyMillis = effectiveRawUncertaintyMillis(
+                timeUncertaintyNanos, biasUncertaintyNanos);
+            long clockElapsedNanos = prefs.getLong("raw_clock_elapsed_nanos", -1L);
+            long callbackElapsedNanos = prefs.getLong("raw_callback_elapsed_nanos", -1L);
+            long sampleElapsedMillis = clockElapsedNanos >= 0
+                ? clockElapsedNanos / 1_000_000L
+                : callbackElapsedNanos > 0 ? callbackElapsedNanos / 1_000_000L : -1L;
+            return new RawGnssSample(available, utcAvailable, offsetMillis,
+                prefs.getLong("raw_gnss_utc_millis", 0L), uncertaintyMillis,
+                uncertaintyEstimated, sampleElapsedMillis,
+                prefs.getInt("raw_measurement_count", 0),
+                prefs.getInt("visible_satellites", -1),
+                prefs.getInt("used_satellites", -1),
+                prefs.getLong("satellite_status_elapsed", -1L),
+                prefs.getInt("fix_count", 0),
+                prefs.getLong("last_fix_elapsed", -1L),
+                prefs.getString("raw_discard_reason", ""));
+        }
+
+        private static double parseDouble(String value) {
+            if (value == null || value.isEmpty()) return Double.NaN;
+            try {
+                return Double.parseDouble(value);
+            } catch (NumberFormatException ignored) {
+                return Double.NaN;
+            }
+        }
+    }
+
+    /** Reads the latest raw GnssClock measurement from this service's store. */
+    static RawGnssSample readRawSample(Context context) {
+        return RawGnssSample.fromPrefs(
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE));
     }
 
     private void startTracking() {

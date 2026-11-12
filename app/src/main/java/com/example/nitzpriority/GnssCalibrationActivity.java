@@ -33,6 +33,15 @@ public final class GnssCalibrationActivity extends Activity {
     private static final int REQUEST_POST_NOTIFICATIONS = 42;
     private static final long GNSS_OPERATION_TIMEOUT_MILLIS = 5 * 60_000L;
     private static final long GNSS_POLL_INTERVAL_MILLIS = 2_000L;
+    /**
+     * Grace window after the first valid raw GnssClock offset before a
+     * calibration may complete on the raw measurement. When the system
+     * GnssTimeUpdateService is running, its suggestion normally follows a
+     * GPS fix within seconds, so 30 s is a generous grace that keeps the
+     * system suggestion primary; only when it still has not arrived does
+     * the raw offset finish the run (labelled as raw-sourced).
+     */
+    private static final long RAW_FALLBACK_GRACE_MILLIS = 30_000L;
     private static final String TIME_DETECTOR_MARKER = "__NITZPRIORITY_TIME_DETECTOR__";
     private static final String GNSS_RESULT_MARKER = "__NITZPRIORITY_GNSS_RESULT__";
     private static final Pattern GNSS_ELAPSED_PATTERN =
@@ -65,6 +74,7 @@ public final class GnssCalibrationActivity extends Activity {
     private LocationManager locationManager;
     private long operationStartElapsedMillis = -1;
     private long operationDeadlineElapsedMillis = -1;
+    private long firstValidRawElapsedMillis = -1;
     private volatile String triggerToken = "";
     private String lastGpsAccuracy = "未知";
     private boolean operationRunning;
@@ -107,7 +117,7 @@ public final class GnssCalibrationActivity extends Activity {
         layout.addView(subtitle, subtitleParams);
 
         TextView description = new TextView(this);
-        description.setText("点击开始后，模块会持续请求 GPS 定位，并等待新的 GNSS 时间样本，最长 5 分钟。建议在室外开阔处操作；持续定位会增加耗电。定位成功不一定代表授时样本已刷新。");
+        description.setText("点击开始后，模块会持续请求 GPS 定位，并等待新的 GNSS 时间样本，最长 5 分钟。建议在室外开阔处操作；持续定位会增加耗电。定位成功不一定代表授时样本已刷新。系统建议始终优先；若系统建议一直不到，将在测得原始 GnssClock 偏移后以其完成本次校准（会明确标注来源是原始时钟）。");
         description.setTextSize(14);
         description.setTextColor(0xFF354258);
         description.setLineSpacing(dp(3), 1f);
@@ -366,6 +376,7 @@ public final class GnssCalibrationActivity extends Activity {
         operationRunning = true;
         triggerSignalSent = false;
         recoveryCancelSent = false;
+        firstValidRawElapsedMillis = -1;
         operationStartElapsedMillis = SystemClock.elapsedRealtime();
         operationDeadlineElapsedMillis = operationStartElapsedMillis
             + GNSS_OPERATION_TIMEOUT_MILLIS;
@@ -438,6 +449,51 @@ public final class GnssCalibrationActivity extends Activity {
         return false;
     }
 
+    /**
+     * The latest raw GnssClock measurement belonging to this run: same
+     * session token, sampled after this run started, and passing every
+     * validity gate in the tracking service. Returns null when there is no
+     * such measurement — a burst-mode or earlier-run sample must never
+     * complete this run's calibration.
+     */
+    private GnssLocationTrackingService.RawGnssSample readCurrentRawSample() {
+        android.content.SharedPreferences prefs =
+            getSharedPreferences("gnss_location_tracking", MODE_PRIVATE);
+        if (!triggerToken.equals(prefs.getString("token", ""))) return null;
+        GnssLocationTrackingService.RawGnssSample raw =
+            GnssLocationTrackingService.RawGnssSample.fromPrefs(prefs);
+        if (!raw.utcAvailable || raw.offsetMillis == Long.MIN_VALUE
+                || raw.sampleElapsedMillis <= operationStartElapsedMillis) return null;
+        return raw;
+    }
+
+    /**
+     * Completes this run on the raw GnssClock offset — the fallback path,
+     * used only when no system suggestion arrived. The offset must be fresh
+     * (sampled within the last 10 s); the result state is SUCCESS_RAW so
+     * the diagnostics page can label it as raw-sourced instead of a system
+     * suggestion. Returns false when there is no usable raw sample, so the
+     * caller keeps waiting or falls through to the timeout branches.
+     * Completing on raw never sets the system clock: it only records the
+     * measured offset as this run's calibration result.
+     */
+    private boolean finishWithRawCalibration() {
+        GnssLocationTrackingService.RawGnssSample raw = readCurrentRawSample();
+        if (raw == null) return false;
+        long ageMillis = SystemClock.elapsedRealtime() - raw.sampleElapsedMillis;
+        if (ageMillis < 0 || ageMillis > 10_000L) return false;
+        long offset = raw.offsetMillis;
+        String direction = offset > 0 ? "落后" : offset < 0 ? "领先" : "与 GNSS 基本一致";
+        String detail = "已用原始 GnssClock 偏移完成本次校准（来源：原始 GNSS 时钟，非系统建议）：本机"
+            + direction + " GNSS"
+            + (offset == 0 ? "" : "约 " + Math.abs(offset) + " 毫秒")
+            + "（±" + raw.uncertaintyMillis + " 毫秒），样本 "
+            + Math.max(0L, ageMillis / 1_000L) + " 秒前。系统未产生新建议；"
+            + "待 LSPosed 生效后，系统建议将优先用于校准。";
+        finishWithResult("SUCCESS_RAW", detail);
+        return true;
+    }
+
     private void pollGnssSuggestion() {
         if (activityDestroyed || isFinishing() || isDestroyed() || !operationRunning) return;
         executeWorker(() -> {
@@ -471,10 +527,28 @@ public final class GnssCalibrationActivity extends Activity {
                     finishWithResult("UNVERIFIED",
                         "无法读取本次 GNSS 状态；请检查 root 授权及 dumpsys 输出。" + brief(result.output));
                 } else if (SystemClock.elapsedRealtime() < operationDeadlineElapsedMillis) {
+                    // Dual path: the system suggestion stays primary. Once a
+                    // valid raw offset exists, keep waiting for the system
+                    // suggestion through the grace window; only when the grace
+                    // expires with no system suggestion does the raw offset
+                    // finish this run. A raw sample that later turns invalid
+                    // resets the grace clock.
+                    GnssLocationTrackingService.RawGnssSample raw = readCurrentRawSample();
+                    if (raw == null) {
+                        firstValidRawElapsedMillis = -1;
+                    } else if (firstValidRawElapsedMillis < 0) {
+                        firstValidRawElapsedMillis = SystemClock.elapsedRealtime();
+                    } else if (SystemClock.elapsedRealtime() - firstValidRawElapsedMillis
+                            >= RAW_FALLBACK_GRACE_MILLIS) {
+                        if (finishWithRawCalibration()) return;
+                    }
                     updateGnssProgress(current);
                     long remaining = operationDeadlineElapsedMillis - SystemClock.elapsedRealtime();
                     mainHandler.postDelayed(this::pollGnssSuggestion,
                         Math.min(GNSS_POLL_INTERVAL_MILLIS, remaining));
+                } else if (finishWithRawCalibration()) {
+                    // Deadline reached with a valid raw offset but no system
+                    // suggestion: complete on raw instead of NO_LOCATION_TIME.
                 } else if (current.locationTimeElapsedMillis > operationStartElapsedMillis) {
                     finishWithResult("PARTIAL",
                         "已收到新的 GNSS 时间样本，但 Android 尚未记录新建议。请查看详细日志。");
@@ -532,7 +606,24 @@ public final class GnssCalibrationActivity extends Activity {
         } else {
             current = "正在等待新的 GNSS 时间样本。";
         }
-        setStatus(current + "\n" + locationStatus + "剩余约 " + remainingSeconds + " 秒。");
+        // Tell the user a raw offset is already in hand and the run will
+        // finish on it once the grace window expires — the system suggestion
+        // is still being waited for in the meantime.
+        String rawNote = "";
+        GnssLocationTrackingService.RawGnssSample raw = readCurrentRawSample();
+        if (raw != null && raw.offsetMillis != Long.MIN_VALUE) {
+            long graceLeftSeconds = firstValidRawElapsedMillis < 0
+                ? RAW_FALLBACK_GRACE_MILLIS / 1_000L
+                : Math.max(0L, (RAW_FALLBACK_GRACE_MILLIS
+                    - (SystemClock.elapsedRealtime() - firstValidRawElapsedMillis)) / 1_000L);
+            rawNote = "已测得原始 GNSS 时钟偏移（本机"
+                + (raw.offsetMillis > 0 ? "落后" : raw.offsetMillis < 0 ? "领先"
+                    : "与 GNSS 基本一致")
+                + (raw.offsetMillis == 0 ? "" : "约 " + Math.abs(raw.offsetMillis) + " 毫秒")
+                + "，±" + raw.uncertaintyMillis + " 毫秒）；仍在等系统建议，"
+                + graceLeftSeconds + " 秒后以原始时钟完成本次校准。\n";
+        }
+        setStatus(current + "\n" + rawNote + locationStatus + "剩余约 " + remainingSeconds + " 秒。");
     }
 
     private String trackingProgress() {
@@ -712,18 +803,32 @@ public final class GnssCalibrationActivity extends Activity {
             }
             String timeUncertainty = prefs.getString("raw_time_uncertainty_nanos", "");
             String biasUncertainty = prefs.getString("raw_bias_uncertainty_nanos", "");
-            if (!timeUncertainty.isEmpty() || !biasUncertainty.isEmpty()) {
-                details.append("芯片报告不确定度（1-sigma）：");
-                if (!timeUncertainty.isEmpty()) {
-                    details.append("时间 ").append(formatNanosAsMillis(timeUncertainty)).append(" ms");
-                }
-                if (!timeUncertainty.isEmpty() && !biasUncertainty.isEmpty()) details.append("；");
+            // Effective uncertainty: the chip-reported values when usable,
+            // otherwise the conservative fallback budget (see
+            // GnssLocationTrackingService.effectiveRawUncertaintyMillis). A
+            // chip reporting 0.000 ms has not measured an uncertainty, so 0
+            // is never shown as the effective value.
+            double timeUncertaintyNanos =
+                readPreferenceDouble(prefs, "raw_time_uncertainty_nanos");
+            double biasUncertaintyNanos =
+                readPreferenceDouble(prefs, "raw_bias_uncertainty_nanos");
+            long effectiveUncertainty =
+                GnssLocationTrackingService.effectiveRawUncertaintyMillis(
+                    timeUncertaintyNanos, biasUncertaintyNanos);
+            details.append("不确定度（1-sigma，有效值）：±").append(effectiveUncertainty)
+                .append(" ms");
+            if (timeUncertaintyNanos > 0) {
+                details.append("（芯片上报时间 ")
+                    .append(formatNanosAsMillis(timeUncertainty)).append(" ms");
                 if (!biasUncertainty.isEmpty()) {
-                    details.append("偏差 ").append(formatNanosAsMillis(biasUncertainty)).append(" ms");
+                    details.append("，偏差 ").append(formatNanosAsMillis(biasUncertainty))
+                        .append(" ms；已按平方和合成");
                 }
-                details.append("\n芯片报告 0.000 ms 不代表真实 UTC 绝对误差为零。\n");
+                details.append("）\n");
             } else {
-                details.append("芯片未提供时钟不确定度字段。\n");
+                details.append("（芯片未上报有效时间不确定度，按保守预算 ±")
+                    .append(GnssLocationTrackingService.RAW_UNCERTAINTY_FALLBACK_MILLIS)
+                    .append(" ms 计；0.000 ms 不代表真实 UTC 绝对误差为零）\n");
             }
             String elapsedUncertainty = prefs.getString("raw_elapsed_uncertainty_nanos", "");
             if (!elapsedUncertainty.isEmpty()) {
@@ -798,6 +903,7 @@ public final class GnssCalibrationActivity extends Activity {
         saveCalibrationResult(state, message);
         String prefix;
         if ("SUCCESS".equals(state)) prefix = "授时请求完成：";
+        else if ("SUCCESS_RAW".equals(state)) prefix = "原始 GNSS 时钟校准完成：";
         else if ("NO_NEW_SAMPLE".equals(state)) prefix = "本次未触发新 GNSS 建议：";
         else if ("NO_LOCATION_TIME".equals(state)) prefix = "GNSS 授时样本获取失败：";
         else if ("STALE_LOCATION_TIME".equals(state)) prefix = "GNSS 时间样本未更新：";
@@ -821,7 +927,7 @@ public final class GnssCalibrationActivity extends Activity {
     private void animateStatusResult(String state) {
         if (statusView == null || statusBackground == null) return;
         int target;
-        if ("SUCCESS".equals(state)) {
+        if ("SUCCESS".equals(state) || "SUCCESS_RAW".equals(state)) {
             target = 0x5522C55E;
         } else if ("FAILED".equals(state) || "NO_LOCATION_TIME".equals(state)
                 || "STALE_LOCATION_TIME".equals(state) || "UNVERIFIED".equals(state)) {
