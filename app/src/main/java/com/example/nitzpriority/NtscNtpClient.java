@@ -33,8 +33,9 @@ final class NtscNtpClient {
     private static final String TAG = "NitzPriority";
 
     /**
-     * NTSC public NTP hosts, tried in order. Domains only; the hard-coded
-     * IPs ({@link #NTSC_DIRECT_IPS}) are a last-resort fallback below, not hosts.
+     * NTSC public NTP hosts, tried in order. Domains only — no hard-coded
+     * IPs anywhere in this client: the address to query always comes from
+     * resolving the domain name.
      * Only ntp.ntsc.ac.cn is listed: the numbered names ntp1/ntp2/ntp3 have
      * no DNS records at all (verified on device 2026-11-12: ntp.ntsc.ac.cn
      * resolves, ntp1/ntp2/ntp3 all return "unknown host"), and the official
@@ -46,26 +47,6 @@ final class NtscNtpClient {
      */
     static final String[] NTSC_HOSTS = {
         "ntp.ntsc.ac.cn",
-    };
-    /**
-     * The addresses ntp.ntsc.ac.cn actually resolves to (per public
-     * documentation and observed NTP use), tried as direct-IP fallbacks when
-     * the domain failed DNS or resolved but never answered. DNS may return a
-     * different address than these (observed on device 2026-11-12: DNS gives
-     * 113.141.164.38, which answers ICMP but not NTP), so the documented
-     * addresses are worth trying directly. 113.141.164.39 is listed first:
-     * it measured 20/20 reachable from Guangdong Telecom and Beijing Aliyun
-     * in November 2026, while .38 (the twin address the phone's DNS returns)
-     * never answers NTP. The old published IP 210.72.145.44 is deliberately
-     * NOT listed: it is 100% packet loss from the phone (ping 2026-11-12)
-     * and appears only in pre-2018 lists. Each IP is only tried when at
-     * least 4 s of the deadline remain, so the pool fallback still gets its
-     * chance.
-     */
-    static final String[] NTSC_DIRECT_IPS = {
-        "113.141.164.39",
-        "114.118.7.161",
-        "114.118.7.163",
     };
     /** Fallback when every NTSC host is unreachable. Not an NTSC source. */
     static final String FALLBACK_HOST = "cn.pool.ntp.org";
@@ -85,14 +66,11 @@ final class NtscNtpClient {
     /**
      * Whole query (all servers) must finish inside this budget. Worst case
      * is 3 DNS-resolved addresses x 6 s (2 x 3 s timeouts each) = 18 s plus
-     * the 2 remaining direct IPs x 6 s = 12 s plus ~1 s for the pool
-     * fallback, so 31 s: the domain's addresses are all tried before the
-     * direct-IP list, and a direct IP already tried via DNS is skipped.
-     * At 15 s the last direct IP never got tried (domain 6 s + first IP
-     * 6 s left 3 s < 4 s gate); at 26 s the third DNS address would have
-     * pushed the last direct IP out again.
+     * ~1 s for the pool fallback, so 21 s. The budget assumes the resolver
+     * returns at most 3 addresses (observed on device 2026-11-13); a fourth
+     * address would squeeze the pool fallback's chance.
      */
-    static final long QUERY_DEADLINE_MILLIS = 31_000;
+    static final long QUERY_DEADLINE_MILLIS = 21_000;
     /** A cached result younger than this is reused instead of querying again. */
     static final long CACHE_TTL_MILLIS = 60_000;
     /** A result older than this is shown as expired, never as fresh. */
@@ -115,9 +93,10 @@ final class NtscNtpClient {
         /** True when the answering host is the pool fallback, not NTSC. */
         final boolean fallback;
         /**
-         * True when the answer came from an NTSC direct-IP fallback
-         * ({@link #NTSC_DIRECT_IPS}). The server field then holds the IP, and
-         * the UI must say "NTSC IP direct" rather than imply a name resolved.
+         * True when the answer came from an NTSC direct-IP fallback. No
+         * direct-IP path sets this today (the hard-coded-IP fallback was
+         * removed 2026-11-13: domains only); kept so the UI contract that
+         * reads it is unchanged.
          */
         final boolean directIp;
         /** Median offset: server time minus phone time, in ms. Positive = phone lags. */
@@ -209,18 +188,13 @@ final class NtscNtpClient {
 
     /**
      * Tries, in order: the NTSC domain (every address it resolves to, via
-     * getAllByName), the NTSC direct IPs not already tried via DNS (when the
-     * domain failed DNS, or resolved but no address answered), then the pool
-     * fallback. An IP is worth trying even when the name resolved: DNS may
-     * return a different address than the documented ones (observed on
-     * device 2026-11-12: ntp.ntsc.ac.cn resolves to 113.141.164.38, which
-     * answers ICMP but not NTP), and the DNS address may not serve NTP while
-     * the documented addresses do. Each IP attempt is skipped when under 4 s
-     * of the deadline remain, so the pool fallback still gets a chance. A
-     * per-address failure never aborts the query: DNS failure, timeout, and
-     * too-few-samples are recorded per address and the next address is tried.
-     * Only when every name failed DNS does the result say so; a timeout is
-     * never reported as a DNS failure.
+     * getAllByName), then the pool fallback. No hard-coded IP is ever tried:
+     * if the domain fails DNS or none of its addresses answers, the query
+     * goes straight to the pool. A per-address failure never aborts the
+     * query: DNS failure, timeout, and too-few-samples are recorded per
+     * address and the next address is tried. Only when every name failed
+     * DNS does the result say so; a timeout is never reported as a DNS
+     * failure.
      */
     private static Result queryFresh() {
         long deadlineElapsed = SystemClock.elapsedRealtime() + QUERY_DEADLINE_MILLIS;
@@ -228,7 +202,6 @@ final class NtscNtpClient {
         StringBuilder attempts = new StringBuilder();
         Set<String> triedAddresses = new HashSet<>();
         int dnsFailures = 0;
-        boolean ntpUnanswered = false;
         for (String host : NTSC_HOSTS) {
             try {
                 Result result = queryServer(host, false, false, deadlineElapsed,
@@ -236,7 +209,6 @@ final class NtscNtpClient {
                 if (result != null) {
                     return withAttempts(result, attempts.toString());
                 }
-                ntpUnanswered = true;
                 lastError = "服务器 " + host + " 有效样本不足 3 个";
             } catch (UnknownHostException e) {
                 // One dead name must not kill the whole query: ntp1.ntsc.ac.cn
@@ -246,7 +218,6 @@ final class NtscNtpClient {
                 lastError = "服务器 " + host + " DNS 解析失败";
                 recordAttempt(attempts, host, "DNS 解析失败");
             } catch (SocketTimeoutException e) {
-                ntpUnanswered = true;
                 lastError = "服务器 " + host + " 超时无响应";
             } catch (Exception e) {
                 lastError = "服务器 " + host + " 查询失败：" + e.getMessage();
@@ -254,44 +225,6 @@ final class NtscNtpClient {
             if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
                 return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
                     + " 秒），" + lastError, attempts.toString());
-            }
-        }
-        // Direct-IP fallbacks. A literal IP needs no DNS, so these are the
-        // one thing that can still work when name resolution is broken — and
-        // also when resolution works but points at an address that does not
-        // serve NTP. Each IP is only tried when at least 4 s of the deadline
-        // remain, so the pool fallback still gets its chance.
-        if (dnsFailures > 0 || ntpUnanswered) {
-            for (String directIp : NTSC_DIRECT_IPS) {
-                if (triedAddresses.contains(directIp)) {
-                    recordAttempt(attempts, directIp, "域名解析中已试过，跳过");
-                    continue;
-                }
-                long remainingMillis = deadlineElapsed - SystemClock.elapsedRealtime();
-                if (remainingMillis < 4000) {
-                    recordAttempt(attempts, directIp,
-                        "未尝试（剩余 " + Math.max(0L, remainingMillis / 1000) + " 秒）");
-                    break;
-                }
-                try {
-                    Result result = queryServer(directIp, false, true, deadlineElapsed,
-                        triedAddresses, attempts);
-                    if (result != null) {
-                        return withAttempts(result, attempts.toString());
-                    }
-                    lastError = "授时中心 IP 直连 " + directIp + " 有效样本不足 3 个";
-                } catch (UnknownHostException e) {
-                    // A literal IP never needs DNS; treat it as unreachable.
-                    lastError = "授时中心 IP 直连 " + directIp + " 无法访问";
-                } catch (SocketTimeoutException e) {
-                    lastError = "授时中心 IP 直连 " + directIp + " 超时无响应";
-                } catch (Exception e) {
-                    lastError = "授时中心 IP 直连 " + directIp + " 查询失败：" + e.getMessage();
-                }
-                if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
-                    return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
-                        + " 秒），" + lastError, attempts.toString());
-                }
             }
         }
         try {
