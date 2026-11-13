@@ -187,6 +187,18 @@ final class NtscNtpClient {
     }
 
     /**
+     * Last successful query result without any I/O; null when nothing was
+     * ever queried successfully. The diagnostics page renders with this
+     * first and refreshes it in the background, so a slow NTSC query (up
+     * to 21 s) never blocks the page from showing.
+     */
+    static Result cachedResult() {
+        synchronized (LOCK) {
+            return cachedResult;
+        }
+    }
+
+    /**
      * Tries, in order: the NTSC domain (every address it resolves to, via
      * getAllByName), then the pool fallback. No hard-coded IP is ever tried:
      * if the domain fails DNS or none of its addresses answers, the query

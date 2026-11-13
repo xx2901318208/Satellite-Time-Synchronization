@@ -60,6 +60,12 @@ public final class TimeDiagnosticsActivity extends Activity {
     // Default OFF; the module reads debug.nitz.ntp_ntsc_enabled instead,
     // this pref only remembers what the user last chose.
     private static final String NTP_NTSC_ENABLED_PREF = "ntp_ntsc_enabled";
+    // Last refresh's root outcome, so the next entry does not claim "no
+    // root" before the first refresh lands; a later refresh corrects it.
+    private static final String HAS_ROOT_PREF = "diagnostics_has_root";
+    // Last rendered page HTML, for instant display on the next entry while
+    // the background refresh runs (stale-while-revalidate).
+    private static final String CACHED_HTML_FILE = "diagnostics_last.html";
     // Force-jump sources must all be fresh: GNSS, NITZ and NTP alike (was 24 h for
     // NITZ/NTP). NTP_REFERENCE_MAX_AGE_MILLIS below is display-only and unchanged.
     private static final long MAX_FORCE_SAMPLE_AGE_MILLIS = 600_000L;
@@ -414,7 +420,19 @@ public final class TimeDiagnosticsActivity extends Activity {
         calibrateButton.setOnClickListener(view ->
             startActivity(new Intent(this, GnssCalibrationActivity.class)));
         forceButton.setOnClickListener(view -> chooseForceSource());
-        showHtml(loadingHtml());
+        // Show the last rendered page at once (stale-while-revalidate) so
+        // entering the page never stares at "loading" while the refresh
+        // runs; the background refresh replaces it within seconds. The
+        // root flag is restored the same way, so the page does not claim
+        // "no root" before the first refresh lands.
+        currentDiagnosticsHasRoot = getSharedPreferences("settings", MODE_PRIVATE)
+            .getBoolean(HAS_ROOT_PREF, false);
+        String cachedHtml = readCachedHtml();
+        if (cachedHtml != null) {
+            showHtml(cachedHtml);
+        } else {
+            showHtml(loadingHtml());
+        }
     }
 
     private GradientDrawable pageGlassBackground() {
@@ -506,6 +524,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             .remove("force_state").remove("force_detail").remove("force_time")
             .apply();
         getSharedPreferences("gnss_location_tracking", MODE_PRIVATE).edit().clear().apply();
+        deleteFile(CACHED_HTML_FILE);
         Toast.makeText(this, "本地历史已清理；Android 系统授时日志仍由系统保留。",
             Toast.LENGTH_LONG).show();
         refresh();
@@ -552,6 +571,11 @@ public final class TimeDiagnosticsActivity extends Activity {
     }
 
     private void applyThresholdSetting() {
+        if (!currentDiagnosticsHasRoot && refreshInProgress) {
+            Toast.makeText(this, "正在刷新诊断，确认 Root 状态后即可操作",
+                Toast.LENGTH_SHORT).show();
+            return;
+        }
         if (!currentDiagnosticsHasRoot) {
             Toast.makeText(this, "请先授予 Root 并刷新诊断", Toast.LENGTH_LONG).show();
             return;
@@ -599,6 +623,12 @@ public final class TimeDiagnosticsActivity extends Activity {
     // switch to the last saved choice instead of leaving it showing a state
     // the system does not have.
     private void applyNtpSwitch(boolean checked) {
+        if (!currentDiagnosticsHasRoot && refreshInProgress) {
+            Toast.makeText(this, "正在刷新诊断，确认 Root 状态后即可操作",
+                Toast.LENGTH_SHORT).show();
+            setNtpSwitchChecked(!checked);
+            return;
+        }
         if (!currentDiagnosticsHasRoot) {
             Toast.makeText(this, "请先授予 Root 并刷新诊断", Toast.LENGTH_LONG).show();
             setNtpSwitchChecked(!checked);
@@ -750,6 +780,11 @@ public final class TimeDiagnosticsActivity extends Activity {
             // stderr, which the root helper merges into this output).
             String ntpDump = ntpDumpParts.length > 1 ? ntpDumpParts[1] : "";
             boolean hasRoot = result.exitCode == 0 && identity.contains("uid=0");
+            // Remember the outcome so the next entry does not claim "no
+            // root" before the first refresh lands; a later refresh
+            // corrects it if root was revoked.
+            getSharedPreferences("settings", MODE_PRIVATE).edit()
+                .putBoolean(HAS_ROOT_PREF, hasRoot).apply();
             // Drift samples come from the same refresh that draws the page:
             // the fresh GNSS trend point and the independent NTSC result are
             // both (reference - phone) offsets at an elapsed instant. The
@@ -768,15 +803,13 @@ public final class TimeDiagnosticsActivity extends Activity {
                     ClockDriftEstimator.SOURCE_GNSS);
             }
             List<TrendPoint> trendPoints = loadGnssTrendPoints(trendNowElapsed);
-            // Independent NTSC reference: plain UDP NTP on this worker thread,
-            // never on the main thread. Does not need root and does not touch
-            // the system clock, the detector, or the force-jump flow.
-            NtscNtpClient.Result ntscResult = NtscNtpClient.query(forceNtsc);
-            if (ntscResult != null && ntscResult.success) {
-                ClockDriftEstimator.recordSample(settingsPrefs,
-                    ntscResult.queryElapsedRealtimeMillis, ntscResult.offsetMillis,
-                    ntscResult.uncertaintyMillis, ClockDriftEstimator.SOURCE_NTP);
-            }
+            // Independent NTSC reference, phase 1: use only the cached
+            // result (no I/O). A fresh query can take up to 21 s and must
+            // not block the page; phase 2 below fetches it in the
+            // background and updates just the NTSC card when it lands.
+            // The card and the log both accept a null result ("not queried
+            // yet"), and the drift sample is recorded in phase 2 instead.
+            NtscNtpClient.Result ntscResult = NtscNtpClient.cachedResult();
             // Keep this refresh for the copy-log button: it reuses exactly
             // these dumps and results instead of running dumpsys a second time.
             // The raw GnssClock sample is read here too, so the page and the
@@ -785,22 +818,27 @@ public final class TimeDiagnosticsActivity extends Activity {
                 GnssLocationTrackingService.readRawSample(this);
             SystemNtpInfo systemNtp = new SystemNtpInfo(
                 ntpSwitch, ntpStatus, ntpServer, ntpDump);
-            lastDiagnosticSnapshot = new DiagnosticSnapshot(hasRoot, identity,
-                timeDump, gnssDump, thresholdStatus, thresholdConfig,
-                nitzCalibrationStatus, calibrationState, calibrationDetail,
-                calibrationTime, calibrationStartElapsed, forceState, forceDetail,
-                forceTime, trendPoints, ntscResult, rawGnss, hookActive, gnssService,
-                systemNtp,
-                System.currentTimeMillis(), SystemClock.elapsedRealtime());
-            String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
+            // Phase 1 render: page first, with the cached NTSC result.
+            final boolean needsFreshNtsc = forceNtsc || ntscResult == null
+                || ntscResult.ageMillis(SystemClock.elapsedRealtime())
+                    >= NtscNtpClient.CACHE_TTL_MILLIS;
+            String html = renderSnapshot(hasRoot, identity, timeDump, gnssDump,
                 calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
                 forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
                 nitzCalibrationStatus, trendPoints, ntscResult, rawGnss,
                 hookActive, gnssService, systemNtp);
             runOnUiThread(() -> {
-                refreshInProgress = false;
-                setRefreshing(false);
-                refreshButton.setEnabled(true);
+                if (isFinishing() || isDestroyed()) {
+                    refreshInProgress = false;
+                    return;
+                }
+                // Phase 2 still pending: keep the button disabled and the
+                // bar visible, but the page is already shown.
+                if (!needsFreshNtsc) {
+                    refreshInProgress = false;
+                    setRefreshing(false);
+                }
+                refreshButton.setEnabled(!needsFreshNtsc);
                 forceButton.setEnabled(currentDiagnosticsHasRoot && currentForceOptions.length > 0);
                 applyThresholdButton.setEnabled(currentDiagnosticsHasRoot);
                 if (hasRoot && !thresholdInput.hasFocus()) {
@@ -815,15 +853,99 @@ public final class TimeDiagnosticsActivity extends Activity {
                     setNtpSwitchChecked("1".equals(ntpSwitch));
                 }
                 showHtml(html);
-                if (pendingCopyAfterRefresh) {
-                    pendingCopyAfterRefresh = false;
-                    copyDiagnosticLog();
-                } else if (pendingShareAfterRefresh) {
-                    pendingShareAfterRefresh = false;
-                    shareDiagnosticLog();
+                if (!needsFreshNtsc) {
+                    if (pendingCopyAfterRefresh) {
+                        pendingCopyAfterRefresh = false;
+                        copyDiagnosticLog();
+                    } else if (pendingShareAfterRefresh) {
+                        pendingShareAfterRefresh = false;
+                        shareDiagnosticLog();
+                    }
                 }
             });
+            // Phase 2: fresh NTSC in the background. The page is already
+            // visible from phase 1; only the NTSC card updates when this
+            // lands, instead of the whole refresh waiting up to 21 s.
+            // Left the page already: skip the pointless query.
+            if (!isFinishing() && !isDestroyed() && needsFreshNtsc) {
+                NtscNtpClient.Result freshNtsc = NtscNtpClient.query(forceNtsc);
+                if (freshNtsc != null && (ntscResult == null
+                        || freshNtsc.queryElapsedRealtimeMillis
+                            != ntscResult.queryElapsedRealtimeMillis)) {
+                    if (freshNtsc.success) {
+                        ClockDriftEstimator.recordSample(settingsPrefs,
+                            freshNtsc.queryElapsedRealtimeMillis, freshNtsc.offsetMillis,
+                            freshNtsc.uncertaintyMillis, ClockDriftEstimator.SOURCE_NTP);
+                    }
+                    String freshHtml = renderSnapshot(hasRoot, identity, timeDump, gnssDump,
+                        calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
+                        forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
+                        nitzCalibrationStatus, trendPoints, freshNtsc, rawGnss,
+                        hookActive, gnssService, systemNtp);
+                    runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) {
+                            refreshInProgress = false;
+                            return;
+                        }
+                        refreshInProgress = false;
+                        setRefreshing(false);
+                        refreshButton.setEnabled(true);
+                        forceButton.setEnabled(currentDiagnosticsHasRoot && currentForceOptions.length > 0);
+                        applyThresholdButton.setEnabled(currentDiagnosticsHasRoot);
+                        showHtml(freshHtml);
+                        if (pendingCopyAfterRefresh) {
+                            pendingCopyAfterRefresh = false;
+                            copyDiagnosticLog();
+                        } else if (pendingShareAfterRefresh) {
+                            pendingShareAfterRefresh = false;
+                            shareDiagnosticLog();
+                        }
+                    });
+                } else {
+                    // Fresh query returned the same result another refresh
+                    // already recorded: nothing to redraw, just finish.
+                    runOnUiThread(() -> {
+                        refreshInProgress = false;
+                        setRefreshing(false);
+                        refreshButton.setEnabled(true);
+                        if (pendingCopyAfterRefresh) {
+                            pendingCopyAfterRefresh = false;
+                            copyDiagnosticLog();
+                        } else if (pendingShareAfterRefresh) {
+                            pendingShareAfterRefresh = false;
+                            shareDiagnosticLog();
+                        }
+                    });
+                }
+            }
         });
+    }
+
+    /**
+     * Builds the snapshot + page HTML for one refresh's data and caches the
+     * HTML for instant display on the next entry. Runs off the main thread;
+     * buildHtml also publishes currentDiagnosticsHasRoot as a side effect.
+     */
+    private String renderSnapshot(boolean hasRoot, String identity, String timeDump, String gnssDump,
+            String calibrationState, String calibrationDetail, long calibrationTime, long calibrationStartElapsed,
+            String forceState, String forceDetail, long forceTime, String thresholdStatus, String thresholdConfig,
+            String nitzCalibrationStatus, List<TrendPoint> trendPoints,
+            NtscNtpClient.Result ntscResult, GnssLocationTrackingService.RawGnssSample rawGnss,
+            String hookActive, String gnssService, SystemNtpInfo systemNtp) {
+        lastDiagnosticSnapshot = new DiagnosticSnapshot(hasRoot, identity,
+            timeDump, gnssDump, thresholdStatus, thresholdConfig,
+            nitzCalibrationStatus, calibrationState, calibrationDetail,
+            calibrationTime, calibrationStartElapsed, forceState, forceDetail,
+            forceTime, trendPoints, ntscResult, rawGnss, hookActive, gnssService,
+            systemNtp,
+            System.currentTimeMillis(), SystemClock.elapsedRealtime());
+        String html = buildHtml(hasRoot, identity, timeDump, gnssDump,
+            calibrationState, calibrationDetail, calibrationTime, calibrationStartElapsed,
+            forceState, forceDetail, forceTime, thresholdStatus, thresholdConfig,
+            nitzCalibrationStatus, trendPoints, ntscResult, rawGnss,
+            hookActive, gnssService, systemNtp);
+        writeCachedHtml(html);
+        return html;
     }
 
     /** Thin indeterminate bar under the action row while a refresh is running. */
@@ -2395,6 +2517,13 @@ public final class TimeDiagnosticsActivity extends Activity {
     }
 
     private void chooseForceSource() {
+        if (!currentDiagnosticsHasRoot && refreshInProgress) {
+            // First refresh still running: the flag is not "no root", it
+            // is "not confirmed yet". Never show the grant dialog for that.
+            Toast.makeText(this, "正在刷新诊断，确认 Root 状态后即可操作",
+                Toast.LENGTH_SHORT).show();
+            return;
+        }
         if (!currentDiagnosticsHasRoot) {
             new AlertDialog.Builder(this)
                 .setTitle("需要 Root 权限")
@@ -3180,6 +3309,29 @@ public final class TimeDiagnosticsActivity extends Activity {
     private static String limit(String value, int maxChars) {
         if (value == null || value.length() <= maxChars) return value == null ? "" : value;
         return value.substring(0, maxChars) + "…";
+    }
+
+    /** Last rendered page HTML, or null when no refresh ever rendered one. */
+    private String readCachedHtml() {
+        try (java.io.FileInputStream in = openFileInput(CACHED_HTML_FILE)) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int n;
+            while ((n = in.read(buffer)) >= 0) out.write(buffer, 0, n);
+            if (out.size() <= 0) return null;
+            return out.toString(java.nio.charset.StandardCharsets.UTF_8.name());
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** Best-effort: a failed write must never break the refresh. */
+    private void writeCachedHtml(String html) {
+        try (java.io.FileOutputStream out = openFileOutput(CACHED_HTML_FILE, MODE_PRIVATE)) {
+            out.write(html.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Throwable ignored) {
+            // Cached page is a convenience only.
+        }
     }
 
     private String loadingHtml() {
