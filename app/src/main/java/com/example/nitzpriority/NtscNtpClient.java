@@ -47,13 +47,17 @@ final class NtscNtpClient {
      * the domain failed DNS or resolved but never answered. DNS may return a
      * different address than these (observed on device 2026-11-12: DNS gives
      * 113.141.164.38, which answers ICMP but not NTP), so the documented
-     * addresses are worth trying directly. The old published IP 210.72.145.44
-     * is deliberately NOT listed: it is 100% packet loss from the phone
-     * (ping 2026-11-12) and appears only in pre-2018 lists. Each IP is only
-     * tried when at least 4 s of the deadline remain, so the pool fallback
-     * still gets its chance.
+     * addresses are worth trying directly. 113.141.164.39 is listed first:
+     * it measured 20/20 reachable from Guangdong Telecom and Beijing Aliyun
+     * in November 2026, while .38 (the twin address the phone's DNS returns)
+     * never answers NTP. The old published IP 210.72.145.44 is deliberately
+     * NOT listed: it is 100% packet loss from the phone (ping 2026-11-12)
+     * and appears only in pre-2018 lists. Each IP is only tried when at
+     * least 4 s of the deadline remain, so the pool fallback still gets its
+     * chance.
      */
     static final String[] NTSC_DIRECT_IPS = {
+        "113.141.164.39",
         "114.118.7.161",
         "114.118.7.163",
     };
@@ -72,8 +76,14 @@ final class NtscNtpClient {
     static final int DISCARDED_WORST_SAMPLES = 2;
     static final int MIN_VALID_SAMPLES = 3;
     static final int MAX_CONSECUTIVE_TIMEOUTS_PER_SERVER = 2;
-    /** Whole query (all servers) must finish inside this budget. */
-    static final long QUERY_DEADLINE_MILLIS = 15_000;
+    /**
+     * Whole query (all servers) must finish inside this budget. Worst case
+     * is 4 NTSC candidates x 6 s (2 x 3 s timeouts each) = 24 s plus ~1 s for
+     * the pool fallback, so 26 s: at 15 s the last direct IP never got tried
+     * (domain 6 s + first IP 6 s left 3 s < 4 s gate), and 21 s would still
+     * leave it untried once the fourth candidate was added.
+     */
+    static final long QUERY_DEADLINE_MILLIS = 26_000;
     /** A cached result younger than this is reused instead of querying again. */
     static final long CACHE_TTL_MILLIS = 60_000;
     /** A result older than this is shown as expired, never as fresh. */
@@ -115,6 +125,16 @@ final class NtscNtpClient {
         final long queryElapsedRealtimeMillis;
         /** Failure reason in plain language, null on success. */
         final String error;
+        /**
+         * Per-host attempt record for this query, e.g.
+         * "ntp.ntsc.ac.cn：超时无响应；113.141.164.39：成功". Built by
+         * {@link #queryFresh()} across every host tried (and every host
+         * skipped for lack of deadline); null for cached results predating
+         * this field and for queries that failed before any host was tried.
+         * Shown in diagnostics so a fallback to pool can be traced to the
+         * exact host and failure, instead of only the last error.
+         */
+        final String attempts;
         /** Most recent successful result, if any and still within max age. */
         final Result lastGood;
 
@@ -122,7 +142,7 @@ final class NtscNtpClient {
                 long offsetMillis,
                 long uncertaintyMillis, long medianRttMillis, int sampleCount,
                 int samplesAttempted, long queryElapsedRealtimeMillis, String error,
-                Result lastGood) {
+                Result lastGood, String attempts) {
             this.success = success;
             this.server = server;
             this.fallback = fallback;
@@ -135,6 +155,7 @@ final class NtscNtpClient {
             this.queryElapsedRealtimeMillis = queryElapsedRealtimeMillis;
             this.error = error;
             this.lastGood = lastGood;
+            this.attempts = attempts;
         }
 
         long ageMillis(long nowElapsed) {
@@ -166,7 +187,7 @@ final class NtscNtpClient {
         try {
             fresh = queryFresh();
         } catch (Throwable t) {
-            fresh = failure("查询异常：" + t.getClass().getSimpleName());
+            fresh = failure("查询异常：" + t.getClass().getSimpleName(), null);
         }
         synchronized (LOCK) {
             if (fresh.success) {
@@ -194,29 +215,37 @@ final class NtscNtpClient {
     private static Result queryFresh() {
         long deadlineElapsed = SystemClock.elapsedRealtime() + QUERY_DEADLINE_MILLIS;
         String lastError = "未知错误";
+        StringBuilder attempts = new StringBuilder();
         int dnsFailures = 0;
         boolean ntpUnanswered = false;
         for (String host : NTSC_HOSTS) {
             try {
                 Result result = queryServer(host, false, false, deadlineElapsed);
-                if (result != null) return result;
+                if (result != null) {
+                    recordAttempt(attempts, host, "成功");
+                    return withAttempts(result, attempts.toString());
+                }
                 ntpUnanswered = true;
                 lastError = "服务器 " + host + " 有效样本不足 3 个";
+                recordAttempt(attempts, host, "有效样本不足 3 个");
             } catch (UnknownHostException e) {
                 // One dead name must not kill the whole query: ntp1.ntsc.ac.cn
                 // has no DNS record at all, while the other names may resolve
                 // fine. Record it and try the next host.
                 dnsFailures++;
                 lastError = "服务器 " + host + " DNS 解析失败";
+                recordAttempt(attempts, host, "DNS 解析失败");
             } catch (SocketTimeoutException e) {
                 ntpUnanswered = true;
                 lastError = "服务器 " + host + " 超时无响应";
+                recordAttempt(attempts, host, "超时无响应");
             } catch (Exception e) {
                 lastError = "服务器 " + host + " 查询失败：" + e.getMessage();
+                recordAttempt(attempts, host, "查询失败：" + e.getMessage());
             }
             if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
                 return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
-                    + " 秒），" + lastError);
+                    + " 秒），" + lastError, attempts.toString());
             }
         }
         // Direct-IP fallbacks. A literal IP needs no DNS, so these are the
@@ -227,41 +256,60 @@ final class NtscNtpClient {
         if (dnsFailures > 0 || ntpUnanswered) {
             for (String directIp : NTSC_DIRECT_IPS) {
                 long remainingMillis = deadlineElapsed - SystemClock.elapsedRealtime();
-                if (remainingMillis < 4000) break;
+                if (remainingMillis < 4000) {
+                    recordAttempt(attempts, directIp,
+                        "未尝试（剩余 " + Math.max(0L, remainingMillis / 1000) + " 秒）");
+                    break;
+                }
                 try {
                     Result result = queryServer(directIp, false, true, deadlineElapsed);
-                    if (result != null) return result;
+                    if (result != null) {
+                        recordAttempt(attempts, directIp, "成功");
+                        return withAttempts(result, attempts.toString());
+                    }
                     lastError = "授时中心 IP 直连 " + directIp + " 有效样本不足 3 个";
+                    recordAttempt(attempts, directIp, "有效样本不足 3 个");
                 } catch (UnknownHostException e) {
                     // A literal IP never needs DNS; treat it as unreachable.
                     lastError = "授时中心 IP 直连 " + directIp + " 无法访问";
+                    recordAttempt(attempts, directIp, "无法访问");
                 } catch (SocketTimeoutException e) {
                     lastError = "授时中心 IP 直连 " + directIp + " 超时无响应";
+                    recordAttempt(attempts, directIp, "超时无响应");
                 } catch (Exception e) {
                     lastError = "授时中心 IP 直连 " + directIp + " 查询失败：" + e.getMessage();
+                    recordAttempt(attempts, directIp, "查询失败：" + e.getMessage());
                 }
                 if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
                     return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
-                        + " 秒），" + lastError);
+                        + " 秒），" + lastError, attempts.toString());
                 }
             }
         }
         try {
             Result result = queryServer(FALLBACK_HOST, true, false, deadlineElapsed);
-            if (result != null) return result;
+            if (result != null) {
+                recordAttempt(attempts, FALLBACK_HOST, "成功");
+                return withAttempts(result, attempts.toString());
+            }
             lastError = "服务器 " + FALLBACK_HOST + " 有效样本不足 3 个";
+            recordAttempt(attempts, FALLBACK_HOST, "有效样本不足 3 个");
         } catch (UnknownHostException e) {
             dnsFailures++;
             lastError = "服务器 " + FALLBACK_HOST + " DNS 解析失败";
+            recordAttempt(attempts, FALLBACK_HOST, "DNS 解析失败");
         } catch (SocketTimeoutException e) {
             lastError = "服务器 " + FALLBACK_HOST + " 超时无响应";
+            recordAttempt(attempts, FALLBACK_HOST, "超时无响应");
         } catch (Exception e) {
             lastError = "服务器 " + FALLBACK_HOST + " 查询失败：" + e.getMessage();
+            recordAttempt(attempts, FALLBACK_HOST, "查询失败：" + e.getMessage());
         }
         if (dnsFailures == NTSC_HOSTS.length + 1) {
-            return failure("DNS 解析失败：全部服务器域名均无法解析，请检查网络");
+            return failure("DNS 解析失败：全部服务器域名均无法解析，请检查网络",
+                attempts.toString());
         }
-        return failure("全部服务器无有效响应；" + lastError);
+        return failure("全部服务器无有效响应；" + lastError, attempts.toString());
     }
 
     /**
@@ -302,7 +350,21 @@ final class NtscNtpClient {
         long medianRtt = medianRtt(kept);
         return new Result(true, host, fallback, directIp, Math.round(medianOffset),
             Math.max(0L, medianRtt / 2), medianRtt, kept.size(), attempted,
-            SystemClock.elapsedRealtime(), null, null);
+            SystemClock.elapsedRealtime(), null, null, null);
+    }
+
+    /** Copy of a successful result with the full per-host attempt record attached. */
+    private static Result withAttempts(Result result, String attempts) {
+        return new Result(result.success, result.server, result.fallback, result.directIp,
+                result.offsetMillis, result.uncertaintyMillis, result.medianRttMillis,
+                result.sampleCount, result.samplesAttempted, result.queryElapsedRealtimeMillis,
+                result.error, result.lastGood, attempts);
+    }
+
+    /** One "host：outcome" segment of the per-host attempt record. */
+    private static void recordAttempt(StringBuilder attempts, String host, String outcome) {
+        if (attempts.length() > 0) attempts.append("；");
+        attempts.append(host).append("：").append(outcome);
     }
 
     /** One NTP request/response exchange. Returns null for implausible replies. */
@@ -355,7 +417,7 @@ final class NtscNtpClient {
         return rtts.get(rtts.size() / 2);
     }
 
-    private static Result failure(String error) {
+    private static Result failure(String error, String attempts) {
         Result lastGood = null;
         synchronized (LOCK) {
             if (cachedResult != null && cachedResult.success
@@ -364,7 +426,7 @@ final class NtscNtpClient {
             }
         }
         return new Result(false, null, false, false, 0, -1, -1, 0, 0,
-            SystemClock.elapsedRealtime(), error, lastGood);
+            SystemClock.elapsedRealtime(), error, lastGood, attempts);
     }
 
     private static void writeTimestamp(byte[] buffer, int offset, long unixMillis) {

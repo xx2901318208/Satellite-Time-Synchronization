@@ -1141,6 +1141,9 @@ public final class TimeDiagnosticsActivity extends Activity {
             if (ntsc.isExpired(nowElapsed)) log.append("（已超过 10 分钟）");
             log.append("\n");
         }
+        if (ntsc != null && ntsc.attempts != null && !ntsc.attempts.isEmpty()) {
+            log.append("尝试记录：").append(ntsc.attempts).append("\n");
+        }
 
         log.append("\n== 系统 NTP 实际命中 ==\n");
         SystemNtpInfo ntp = s.systemNtp;
@@ -1698,6 +1701,10 @@ public final class TimeDiagnosticsActivity extends Activity {
             }
             html.append("</div><div class='small'>毫秒是显示精度，不是 1 毫秒绝对精度；"
                 + "公网 NTP 的典型不确定度为 10–30 毫秒，请以“差值 ± 不确定度”一起读。</div>");
+        }
+        if (result != null && result.attempts != null && !result.attempts.isEmpty()) {
+            html.append("<div class='sync-detail'>尝试记录：")
+                .append(escape(result.attempts)).append("。</div>");
         }
         html.append(systemNtpSection(systemNtp, timeDump, nowElapsed));
         return html.append("</div>").toString();
