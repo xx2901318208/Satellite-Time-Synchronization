@@ -91,6 +91,13 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
     // older value failing to match is fail-closed (falls back to the global value).
     private static volatile long lastTelephonySuggestionElapsedMillis = -1;
     private static volatile long lastNetworkSuggestionElapsedMillis = -1;
+    // Post-load guard (see hookThresholdDecisionPath): whether the module has
+    // seen at least one suggestion of any origin since this load. A decision
+    // that arrives before that point is deciding on a suggestion that arrived
+    // before the module loaded, so its origin cannot be matched; the guard
+    // leaves the framework's own threshold in place for that one decision
+    // instead of falling back to the small global value.
+    private static volatile boolean seenAnySuggestionSinceLoad;
     private static volatile boolean gnssStaleFallbackLogged;
     // Effective threshold for the decision currently running on this thread.
     // setSystemClockAndConfidenceUnderWakeLock reads the threshold through
@@ -333,6 +340,7 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                 "setSystemClockAndConfidenceUnderWakeLock",
                 new XC_MethodHook() {
                     private boolean logged;
+                    private boolean guardLogged;
 
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
@@ -347,6 +355,50 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
                             long decisionElapsed = param.args != null && param.args.length > 0
                                 ? extractSuggestionElapsed(param.args[0]) : -1L;
                             int origin = originForDecisionElapsed(decisionElapsed);
+                            if (origin < 0 && !seenAnySuggestionSinceLoad) {
+                                // Post-load guard: this decision's suggestion
+                                // arrived before the module loaded (or before
+                                // the suggestion-recording hooks were
+                                // installed), so its origin cannot be matched
+                                // and the global fallback (100 ms) would let a
+                                // stale pre-load NITZ sample step the clock —
+                                // seen 2026-11-13 17:46:35, when a stale NITZ
+                                // suggestion stepped the clock -629 ms 8 s
+                                // after a system_server restart and GNSS
+                                // corrected it +633 ms 13 s later. Leave the
+                                // framework's own threshold in place for this
+                                // one decision: set the override to the value
+                                // the field already holds (the framework reads
+                                // the threshold through the getter, which
+                                // returns the override), write nothing, publish
+                                // no status. The module starts intervening
+                                // once it has seen a suggestion of any origin.
+                                try {
+                                    Field guardConfigField = param.thisObject.getClass()
+                                        .getDeclaredField("mCurrentConfigurationInternal");
+                                    guardConfigField.setAccessible(true);
+                                    Object guardConfiguration =
+                                        guardConfigField.get(param.thisObject);
+                                    if (guardConfiguration != null) {
+                                        Field guardThresholdField = guardConfiguration.getClass()
+                                            .getDeclaredField("mSystemClockUpdateThresholdMillis");
+                                        guardThresholdField.setAccessible(true);
+                                        int deviceThreshold =
+                                            guardThresholdField.getInt(guardConfiguration);
+                                        decisionThresholdOverride.set(deviceThreshold);
+                                        if (!guardLogged) {
+                                            guardLogged = true;
+                                            XposedBridge.log(TAG + ": post-load guard: unmatched "
+                                                + "decision before any suggestion seen; "
+                                                + "leaving framework threshold "
+                                                + deviceThreshold + " ms untouched");
+                                        }
+                                    }
+                                } catch (Throwable t) {
+                                    XposedBridge.log(TAG + ": post-load guard failed safely: " + t);
+                                }
+                                return;
+                            }
                             int effective = thresholdForOrigin(origin, configured);
                             decisionThresholdOverride.set(effective);
                             logDecisionThreshold(origin, effective, configured);
@@ -932,6 +984,10 @@ public final class NitzPriorityHook implements IXposedHookLoadPackage {
         // cross-thread sampling skew); elapsedRealtime is monotonic, so a value far
         // in the future cannot be a genuine sample.
         if (sampleElapsed > nowElapsed + 2_000) return;
+        // Any plausible suggestion seen since load warms the module up: from
+        // here on, an unmatched decision is a genuinely unknown origin and
+        // the global fallback applies (see the post-load guard).
+        seenAnySuggestionSinceLoad = true;
         switch (origin) {
             case ORIGIN_GNSS:
                 if (sampleElapsed > lastGnssSuggestionElapsedMillis) {
