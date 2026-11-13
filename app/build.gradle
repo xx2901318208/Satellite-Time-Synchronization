@@ -22,6 +22,22 @@ android {
         targetSdk 35
         versionCode 36
         versionName '1.35'
+
+        // Build identity for the in-app update check (UpdateChecker): the
+        // commit this APK was built from and the build time. The app
+        // compares the build time with the `latest` release asset's
+        // updated_at on GitHub; a newer asset means a rebuild happened
+        // after this APK was built. "unknown" when git is unavailable.
+        def gitSha = "unknown"
+        try {
+            gitSha = "git rev-parse --short HEAD".execute().text.trim()
+            if (gitSha.isEmpty()) gitSha = "unknown"
+        } catch (Throwable ignored) {
+            gitSha = "unknown"
+        }
+        resValue "string", "app_build_git_sha", gitSha
+        resValue "string", "app_build_time_millis",
+            String.valueOf(System.currentTimeMillis())
     }
 
     signingConfigs {

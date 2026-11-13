@@ -8,6 +8,7 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
+import android.net.Uri;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -190,6 +191,14 @@ public final class TimeDiagnosticsActivity extends Activity {
     // True while the switch is being set programmatically (refresh sync or
     // apply result): the listener must not re-run applyNtpSwitch then.
     private boolean ntpSwitchSyncing;
+    // In-app update check (UpdateChecker): status line under the "检查更新"
+    // button, and the download URL of the latest release once a check has
+    // found one. The button doubles as the download button while an update
+    // is pending; updateChecking guards double taps.
+    private TextView updateStatusText;
+    private Button checkUpdateButton;
+    private volatile String updateDownloadUrl;
+    private volatile boolean updateChecking;
     // Latest refresh snapshot, kept so "copy diagnostic log" reuses the data
     // already on screen instead of running dumpsys a second time. Written on
     // the refresh worker thread, read on the UI thread.
@@ -377,7 +386,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             .getBoolean(NTP_NTSC_ENABLED_PREF, false));
         ntpCard.addView(ntpSwitch, new LinearLayout.LayoutParams(-1, -2));
         TextView ntpHint = new TextView(this);
-        ntpHint.setText("开启后，系统自动授时（网络 NTP）优先用国家授时中心 ntp.ntsc.ac.cn，失败时回落到 time.android.com；关闭后下次轮询恢复设备默认服务器。需 Root 与 LSPosed 模块已启用；生效在下次系统轮询，切换飞行模式或重连网络可触发轮询。");
+        ntpHint.setText("开启后，系统自动授时（网络 NTP）优先用国家授时中心 ntp.ntsc.ac.cn，失败时回落到 time.android.com；关闭后下次轮询恢复设备默认服务器。需 Root 与 LSPosed 模块已启用；生效在下次系统轮询，Termux 里跑 force_refresh 可立即触发一次轮询。");
         ntpHint.setTextSize(12);
         ntpHint.setTextColor(Color.rgb(104, 117, 138));
         ntpHint.setPadding(dp(4), dp(4), dp(4), dp(2));
@@ -386,6 +395,38 @@ public final class TimeDiagnosticsActivity extends Activity {
             if (ntpSwitchSyncing) return;
             applyNtpSwitch(checked);
         });
+
+        // In-app update check: compares this build's embedded build time
+        // with the rolling `latest` release on GitHub (UpdateChecker), so a
+        // rebuild shows up here without opening the browser first. The card
+        // also shows which commit this APK was built from, so the installed
+        // build is identifiable even though versionCode never changes.
+        LinearLayout updateCard = new LinearLayout(this);
+        updateCard.setOrientation(LinearLayout.VERTICAL);
+        updateCard.setPadding(dp(14), dp(10), dp(14), dp(10));
+        updateCard.setBackground(glassCardBackground());
+        updateCard.setElevation(dp(3));
+        LinearLayout.LayoutParams updateCardParams = new LinearLayout.LayoutParams(-1, -2);
+        updateCardParams.setMargins(dp(12), dp(8), dp(12), 0);
+        root.addView(updateCard, updateCardParams);
+        TextView updateTitle = new TextView(this);
+        updateTitle.setText("应用更新");
+        updateTitle.setTextSize(14);
+        updateTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        updateTitle.setTextColor(Color.rgb(37, 48, 66));
+        updateCard.addView(updateTitle, new LinearLayout.LayoutParams(-1, -2));
+        updateStatusText = new TextView(this);
+        updateStatusText.setText(currentBuildDescription());
+        updateStatusText.setTextSize(12);
+        updateStatusText.setTextColor(Color.rgb(104, 117, 138));
+        updateStatusText.setPadding(dp(4), dp(4), dp(4), dp(2));
+        updateCard.addView(updateStatusText, new LinearLayout.LayoutParams(-1, -2));
+        checkUpdateButton = new Button(this);
+        checkUpdateButton.setText("检查更新");
+        styleButton(checkUpdateButton, 0xFF2F7CF6, 0xFFFFFFFF);
+        updateCard.addView(checkUpdateButton,
+            new LinearLayout.LayoutParams(-2, -2));
+        checkUpdateButton.setOnClickListener(view -> onCheckUpdateClicked());
 
         webView = new WebView(this);
         webView.setBackgroundColor(Color.TRANSPARENT);
@@ -657,6 +698,89 @@ public final class TimeDiagnosticsActivity extends Activity {
                         : "设置失败，请检查 Root 授权与系统属性权限",
                     Toast.LENGTH_LONG).show();
                 refresh();
+            });
+        });
+    }
+
+    // This APK's embedded build time (build.gradle resValue), or 0 when the
+    // field is absent/unparseable (a build from before it existed): 0 means
+    // any release counts as newer, which is the safe direction.
+    private long buildTimeMillis() {
+        try {
+            return Long.parseLong(getString(R.string.app_build_time_millis));
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    // One-line build identity for the update card: commit + build date.
+    private String currentBuildDescription() {
+        String sha = "unknown";
+        try {
+            sha = getString(R.string.app_build_git_sha);
+        } catch (Throwable ignored) {
+            // Missing resource: keep "unknown".
+        }
+        long built = buildTimeMillis();
+        String when = built > 0 ? formatUpdateTime(built) : "未知时间";
+        return "当前构建：" + sha + "（" + when + "）";
+    }
+
+    private static String formatUpdateTime(long millis) {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+            .format(new Date(millis));
+    }
+
+    // "检查更新" tap: while an update is pending the same button downloads
+    // it instead. The network call runs on the worker thread; UI updates
+    // come back on the UI thread.
+    private void onCheckUpdateClicked() {
+        if (updateChecking) {
+            return;
+        }
+        String pendingUrl = updateDownloadUrl;
+        if (pendingUrl != null) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(pendingUrl)));
+            } catch (Throwable t) {
+                Toast.makeText(this, "无法打开下载链接：" + t.getMessage(),
+                    Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        updateChecking = true;
+        checkUpdateButton.setEnabled(false);
+        checkUpdateButton.setText("检查中…");
+        updateStatusText.setText("正在检查 GitHub 上的最新构建…");
+        final long built = buildTimeMillis();
+        worker.execute(() -> {
+            final UpdateChecker.Result result = UpdateChecker.check(built);
+            runOnUiThread(() -> {
+                updateChecking = false;
+                checkUpdateButton.setEnabled(true);
+                if (result.error != null) {
+                    checkUpdateButton.setText("检查更新");
+                    updateStatusText.setText(currentBuildDescription()
+                        + "\n检查失败：" + result.error + "，稍后再试。");
+                    Toast.makeText(this, "检查更新失败：" + result.error,
+                        Toast.LENGTH_LONG).show();
+                    return;
+                }
+                if (result.updateAvailable) {
+                    updateDownloadUrl = result.downloadUrl;
+                    checkUpdateButton.setText("下载新版");
+                    String size = result.assetSizeBytes > 0
+                        ? "（约 " + (result.assetSizeBytes / 1024) + " KB）" : "";
+                    updateStatusText.setText("发现新版：GitHub 最新构建 "
+                        + formatUpdateTime(result.releaseUpdatedAtMillis)
+                        + size + "，点“下载新版”安装。");
+                    Toast.makeText(this, "发现新版", Toast.LENGTH_SHORT).show();
+                } else {
+                    checkUpdateButton.setText("检查更新");
+                    updateStatusText.setText(currentBuildDescription()
+                        + "\n已是最新版。");
+                    Toast.makeText(this, "已是最新版", Toast.LENGTH_SHORT).show();
+                }
             });
         });
     }
