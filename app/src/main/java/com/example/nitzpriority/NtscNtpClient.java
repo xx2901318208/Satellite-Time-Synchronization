@@ -64,13 +64,23 @@ final class NtscNtpClient {
     static final int MIN_VALID_SAMPLES = 3;
     static final int MAX_CONSECUTIVE_TIMEOUTS_PER_SERVER = 2;
     /**
-     * Whole query (all servers) must finish inside this budget. Worst case
-     * is 3 DNS-resolved addresses x 6 s (2 x 3 s timeouts each) = 18 s plus
-     * ~1 s for the pool fallback, so 21 s. The budget assumes the resolver
-     * returns at most 3 addresses (observed on device 2026-11-13); a fourth
-     * address would squeeze the pool fallback's chance.
+     * Whole query (all servers) nominal budget. It is split, not shared:
+     * the NTSC phase gets {@link #NTSC_PHASE_MILLIS} and the pool fallback
+     * always keeps {@link #POOL_RESERVE_MILLIS} of its own, counted from
+     * the moment the pool phase starts. A shared deadline starved the
+     * pool: on device 2026-11-13 15:39 three dead NTSC addresses burned
+     * the full 21 s (each attempt costs ~3.5 s wall — 3 s receive timeout
+     * plus socket setup/send overhead — not the 3 s the old comment
+     * assumed), so the pool never ran and the query failed with no
+     * reference at all. Worst case now is ~15 s NTSC + ~6 s pool, plus
+     * at most one socket timeout of overshoot past the NTSC phase
+     * deadline (a single exchange already in flight is not cut short).
      */
     static final long QUERY_DEADLINE_MILLIS = 21_000;
+    /** NTSC phase budget inside {@link #QUERY_DEADLINE_MILLIS}. */
+    static final long NTSC_PHASE_MILLIS = 15_000;
+    /** Pool-fallback budget, reserved even when NTSC burned its whole phase. */
+    static final long POOL_RESERVE_MILLIS = 6_000;
     /** A cached result younger than this is reused instead of querying again. */
     static final long CACHE_TTL_MILLIS = 60_000;
     /** A result older than this is shown as expired, never as fresh. */
@@ -190,7 +200,7 @@ final class NtscNtpClient {
      * Last successful query result without any I/O; null when nothing was
      * ever queried successfully. The diagnostics page renders with this
      * first and refreshes it in the background, so a slow NTSC query (up
-     * to 21 s) never blocks the page from showing.
+     * to ~24 s worst case) never blocks the page from showing.
      */
     static Result cachedResult() {
         synchronized (LOCK) {
@@ -206,17 +216,24 @@ final class NtscNtpClient {
      * query: DNS failure, timeout, and too-few-samples are recorded per
      * address and the next address is tried. Only when every name failed
      * DNS does the result say so; a timeout is never reported as a DNS
-     * failure.
+     * failure. The pool fallback keeps a reserved budget
+     * ({@link #POOL_RESERVE_MILLIS}, counted from when its phase starts),
+     * so dead NTSC addresses can never starve it (observed 2026-11-13
+     * 15:39: three dead NTSC addresses ate the whole shared 21 s and the
+     * pool never ran, leaving the query with no reference at all).
      */
     private static Result queryFresh() {
-        long deadlineElapsed = SystemClock.elapsedRealtime() + QUERY_DEADLINE_MILLIS;
+        long startElapsed = SystemClock.elapsedRealtime();
+        // The NTSC phase gets its own deadline; the pool fallback always
+        // keeps a reserved budget of its own (see POOL_RESERVE_MILLIS).
+        long ntscDeadline = startElapsed + NTSC_PHASE_MILLIS;
         String lastError = "未知错误";
         StringBuilder attempts = new StringBuilder();
         Set<String> triedAddresses = new HashSet<>();
         int dnsFailures = 0;
         for (String host : NTSC_HOSTS) {
             try {
-                Result result = queryServer(host, false, false, deadlineElapsed,
+                Result result = queryServer(host, false, false, ntscDeadline,
                     triedAddresses, attempts);
                 if (result != null) {
                     return withAttempts(result, attempts.toString());
@@ -234,13 +251,18 @@ final class NtscNtpClient {
             } catch (Exception e) {
                 lastError = "服务器 " + host + " 查询失败：" + e.getMessage();
             }
-            if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
-                return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
-                    + " 秒），" + lastError, attempts.toString());
+            if (SystemClock.elapsedRealtime() >= ntscDeadline) {
+                // NTSC phase spent: stop trying NTSC, but never skip the
+                // pool fallback — it has its own reserved budget below.
+                break;
             }
         }
+        // Pool fallback with a reserved budget, counted from now: even when
+        // NTSC burned its whole phase, the pool still gets up to 6 s (it
+        // answers in ~1 s when reachable, or survives one dead pool IP).
+        long poolDeadline = SystemClock.elapsedRealtime() + POOL_RESERVE_MILLIS;
         try {
-            Result result = queryServer(FALLBACK_HOST, true, false, deadlineElapsed,
+            Result result = queryServer(FALLBACK_HOST, true, false, poolDeadline,
                 triedAddresses, attempts);
             if (result != null) {
                 return withAttempts(result, attempts.toString());
