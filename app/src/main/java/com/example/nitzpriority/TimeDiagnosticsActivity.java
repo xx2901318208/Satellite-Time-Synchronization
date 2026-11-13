@@ -146,19 +146,18 @@ public final class TimeDiagnosticsActivity extends Activity {
         "newSystemClockMillis=(\\d+)");
     private static final Pattern CHANGE_CAUSE_PATTERN = Pattern.compile(
         "cause=([^,\\]]+)");
-    // A "Set system clock confidence" line still carries the clock values read
-    // just before and just after the set. On stock AOSP the confidence path
-    // does not move the clock, so the two readings differ by at most the
-    // execution gap between them (0-1 ms); on this build the confidence path
-    // applies the correction as well (boot NITZ, 2026-11-12 22:25:21:
-    // actual 1794493521075 -> new 1794493521292, +217 ms; an earlier boot:
-    // +331 ms). Anything above this tolerance is a genuine clock step, not
-    // read noise. Genuine corrections are at least the system threshold
-    // (100 ms), so 10 ms sits an order of magnitude above the noise and
-    // below any real step. The log line carries a single elapsed value for
-    // both readings, so there is no separate elapsed delta to deduct; the
-    // tolerance is the deduction.
-    private static final long CLOCK_CHANGE_TOLERANCE_MILLIS = 10L;
+    // A "Set system clock confidence" line carries a PROPOSED new time,
+    // not a post-set reading: the confidence path records the suggestion
+    // the framework declined to apply (below the threshold) and never
+    // moves the clock. Proven 2026-11-13 13:27:48: a confidence line
+    // proposed actual 1794547668078 -> new 1794547667106 (-972 ms) while
+    // the clock never moved — its trajectory plus the network (-5 ms),
+    // NTSC-pool (-1 ms) and raw GnssClock (-12 ms) consensus all agree
+    // the clock stayed accurate, and the Time change log holds no other
+    // set. The three earlier "threshold bypass" cases (-305/-892/-972 ms)
+    // were all sub-threshold proposals, never steps; the framework's
+    // threshold worked as designed. So confidence lines are never clock
+    // changes, and no tolerance on |new-old| may promote one.
     // Latest system-NTP server actually used, from the network suggestion
     // history in dumpsys time_detector: each entry carries
     // mNtpServerSocketAddress=<host>/<ip>:<port> after its UnixEpochTime.
@@ -2223,11 +2222,16 @@ public final class TimeDiagnosticsActivity extends Activity {
                     || line.startsWith("Network suggestion history:"))) break;
             if (!inSection) continue;
 
-            Matcher setMatcher = CLOCK_SET_ORIGIN_PATTERN.matcher(line);
-            Matcher confidenceMatcher = CONFIDENCE_ORIGIN_PATTERN.matcher(line);
-            boolean isSetLine = setMatcher.find();
-            boolean isConfidenceLine = !isSetLine && confidenceMatcher.find();
-            if (!isSetLine && !isConfidenceLine) continue;
+            // Only "Set system clock" lines move the clock. A "Set system
+            // clock confidence" line only records the proposed time: on
+            // 2026-11-13 13:27:48 one proposed -972 ms while the clock
+            // (verified against network/NTSC/raw consensus, and against
+            // its own trajectory) never moved, so confidence lines must
+            // never count as real sets here. (An earlier change did count
+            // them when |new-old| > 10 ms; that misread proposals as
+            // steps and is reverted by this change.)
+            Matcher originMatcher = CLOCK_SET_ORIGIN_PATTERN.matcher(line);
+            if (!originMatcher.find()) continue;
             Matcher elapsedMatcher = CHANGE_LOG_ELAPSED_PATTERN.matcher(line);
             if (!elapsedMatcher.find()) continue;
             try {
@@ -2239,24 +2243,7 @@ public final class TimeDiagnosticsActivity extends Activity {
                     ? 0.0 : Double.parseDouble(elapsedMatcher.group(3));
                 long elapsed = hours * 3_600_000L + minutes * 60_000L
                     + Math.round(seconds * 1_000.0);
-                String origin = isSetLine ? setMatcher.group(1) : confidenceMatcher.group(1);
-                // A confidence line is only a real clock set when the clock
-                // values it reports actually moved (same rule as
-                // findClockActionEvents): the wording alone does not decide.
-                // Without this, a real step recorded only on a confidence
-                // line (e.g. the telephony -892 ms set at 2026-11-13 11:37:30)
-                // is invisible to the calibration card, while a no-op
-                // confidence update would falsely report a set.
-                if (!isSetLine) {
-                    long oldMillis = parseLong(OLD_CLOCK_MILLIS_PATTERN, line, -1L);
-                    long newMillis = parseLong(NEW_CLOCK_MILLIS_PATTERN, line, -1L);
-                    if (oldMillis < 0 || newMillis < 0
-                            || Math.abs(newMillis - oldMillis)
-                                <= CLOCK_CHANGE_TOLERANCE_MILLIS) {
-                        continue;
-                    }
-                }
-                events.add(new ClockSetEvent(origin, elapsed));
+                events.add(new ClockSetEvent(originMatcher.group(1), elapsed));
             } catch (NumberFormatException ignored) {
                 // Ignore malformed or vendor-specific time-change records.
             }
@@ -2299,13 +2286,14 @@ public final class TimeDiagnosticsActivity extends Activity {
                 long newMillis = parseLong(NEW_CLOCK_MILLIS_PATTERN, line, -1L);
                 String cause = localizeChangeCause(
                     parseString(CHANGE_CAUSE_PATTERN, line, "").trim());
-                // The line's wording alone does not decide whether the clock
-                // moved: a confidence line can still carry a real step (see
-                // CLOCK_CHANGE_TOLERANCE_MILLIS). Compare the clock values
-                // the line itself reports instead of trusting the label.
-                boolean clockChanged = isSetLine
-                    || (oldMillis >= 0 && newMillis >= 0
-                        && Math.abs(newMillis - oldMillis) > CLOCK_CHANGE_TOLERANCE_MILLIS);
+                // Only a "Set system clock" line moves the clock. A
+                // confidence line only records the proposed time: its
+                // newSystemClockMillis is the candidate the framework
+                // declined to apply, not a post-set reading, so |new-old|
+                // must never mark it changed. Proven 2026-11-13 13:27:48:
+                // a confidence line proposed -972 ms and the clock never
+                // moved (trajectory + network/NTSC/raw consensus agree).
+                boolean clockChanged = isSetLine;
                 events.add(new ClockActionEvent(origin, elapsed, clockChanged,
                     oldMillis, newMillis, cause));
             } catch (NumberFormatException ignored) {
