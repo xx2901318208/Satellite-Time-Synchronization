@@ -98,17 +98,10 @@ final class NtscNtpClient {
     /** One NTP query result. Immutable; {@code lastGood} is only set on failures. */
     static final class Result {
         final boolean success;
-        /** Host that actually answered, e.g. "ntp.ntsc.ac.cn" or the direct IP. Null on failure. */
+        /** Host that actually answered, e.g. "ntp.ntsc.ac.cn". Null on failure. */
         final String server;
         /** True when the answering host is the pool fallback, not NTSC. */
         final boolean fallback;
-        /**
-         * True when the answer came from an NTSC direct-IP fallback. No
-         * direct-IP path sets this today (the hard-coded-IP fallback was
-         * removed 2026-11-13: domains only); kept so the UI contract that
-         * reads it is unchanged.
-         */
-        final boolean directIp;
         /** Median offset: server time minus phone time, in ms. Positive = phone lags. */
         final long offsetMillis;
         /** Uncertainty budget: median round-trip delay / 2, in ms. */
@@ -136,7 +129,7 @@ final class NtscNtpClient {
         /** Most recent successful result, if any and still within max age. */
         final Result lastGood;
 
-        Result(boolean success, String server, boolean fallback, boolean directIp,
+        Result(boolean success, String server, boolean fallback,
                 long offsetMillis,
                 long uncertaintyMillis, long medianRttMillis, int sampleCount,
                 int samplesAttempted, long queryElapsedRealtimeMillis, String error,
@@ -144,7 +137,6 @@ final class NtscNtpClient {
             this.success = success;
             this.server = server;
             this.fallback = fallback;
-            this.directIp = directIp;
             this.offsetMillis = offsetMillis;
             this.uncertaintyMillis = uncertaintyMillis;
             this.medianRttMillis = medianRttMillis;
@@ -233,7 +225,7 @@ final class NtscNtpClient {
         int dnsFailures = 0;
         for (String host : NTSC_HOSTS) {
             try {
-                Result result = queryServer(host, false, false, ntscDeadline,
+                Result result = queryServer(host, false, ntscDeadline,
                     triedAddresses, attempts);
                 if (result != null) {
                     return withAttempts(result, attempts.toString());
@@ -262,7 +254,7 @@ final class NtscNtpClient {
         // answers in ~1 s when reachable, or survives one dead pool IP).
         long poolDeadline = SystemClock.elapsedRealtime() + POOL_RESERVE_MILLIS;
         try {
-            Result result = queryServer(FALLBACK_HOST, true, false, poolDeadline,
+            Result result = queryServer(FALLBACK_HOST, true, poolDeadline,
                 triedAddresses, attempts);
             if (result != null) {
                 return withAttempts(result, attempts.toString());
@@ -301,7 +293,7 @@ final class NtscNtpClient {
      * be a domain or a literal IP; the sampling, median, and validation logic
      * is identical either way.
      */
-    private static Result queryServer(String host, boolean fallback, boolean directIp,
+    private static Result queryServer(String host, boolean fallback,
             long deadlineElapsed, Set<String> triedAddresses, StringBuilder attempts)
             throws Exception {
         InetAddress[] addresses = InetAddress.getAllByName(host);
@@ -337,7 +329,7 @@ final class NtscNtpClient {
             double medianOffset = medianOffset(kept);
             long medianRtt = medianRtt(kept);
             recordAttempt(attempts, ip, "成功");
-            return new Result(true, host, fallback, directIp, Math.round(medianOffset),
+            return new Result(true, host, fallback, Math.round(medianOffset),
                 Math.max(0L, medianRtt / 2), medianRtt, kept.size(), attempted,
                 SystemClock.elapsedRealtime(), null, null, null);
         }
@@ -346,7 +338,7 @@ final class NtscNtpClient {
 
     /** Copy of a successful result with the full per-host attempt record attached. */
     private static Result withAttempts(Result result, String attempts) {
-        return new Result(result.success, result.server, result.fallback, result.directIp,
+        return new Result(result.success, result.server, result.fallback,
                 result.offsetMillis, result.uncertaintyMillis, result.medianRttMillis,
                 result.sampleCount, result.samplesAttempted, result.queryElapsedRealtimeMillis,
                 result.error, result.lastGood, attempts);
@@ -416,7 +408,7 @@ final class NtscNtpClient {
                 lastGood = cachedResult;
             }
         }
-        return new Result(false, null, false, false, 0, -1, -1, 0, 0,
+        return new Result(false, null, false, 0, -1, -1, 0, 0,
             SystemClock.elapsedRealtime(), error, lastGood, attempts);
     }
 
