@@ -27,6 +27,9 @@ android {
     signingConfigs {
         release {
             storeFile releaseKeystore
+            // The release keystore is PKCS#12 (generated with openssl);
+            // the default JKS type cannot read it.
+            storeType 'PKCS12'
             storePassword keystoreProps.getProperty('storePassword')
             keyAlias keystoreProps.getProperty('keyAlias', 'nitzpriority')
             keyPassword keystoreProps.getProperty('keyPassword')
