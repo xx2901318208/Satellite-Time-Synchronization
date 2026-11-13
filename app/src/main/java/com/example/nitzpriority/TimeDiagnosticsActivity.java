@@ -129,12 +129,6 @@ public final class TimeDiagnosticsActivity extends Activity {
     private static final Pattern GNSS_SERVICE_SAMPLE_PATTERN = Pattern.compile(
         "mLastSuggestedGnssTime:[^}]*?mElapsedRealtimeMillis=(\\d+)[^}]*?"
             + "mUnixEpochTimeMillis=(\\d+)");
-    // mSlotIndex is the first field of TelephonyTimeSuggestion in AOSP, before the
-    // nested UnixEpochTime object, so it can be captured without crossing a brace.
-    private static final Pattern TELEPHONY_SLOT_PATTERN = Pattern.compile(
-        "TelephonyTimeSuggestion\\{[^}]*?mSlotIndex=(\\d+)[^}]*?"
-            + "mUnixEpochTime=UnixEpochTime\\{mElapsedRealtimeMillis=(\\d+),"
-            + "\\s*mUnixEpochTimeMillis=(\\d+)");
     private static final Pattern CLOCK_SET_ORIGIN_PATTERN = Pattern.compile(
         "(?i)Set system clock(?!\\s+confidence).*?origin=([a-z0-9_-]+)");
     private static final Pattern CONFIDENCE_ORIGIN_PATTERN = Pattern.compile(
@@ -181,6 +175,14 @@ public final class TimeDiagnosticsActivity extends Activity {
     private Button refreshButton;
     private Button copyLogButton;
     private ProgressBar refreshProgress;
+    // Slim status row under the action row: "正在刷新…" while a refresh runs,
+    // "上次刷新 HH:mm:ss" after it lands, so a tap visibly did something.
+    private TextView refreshStatusText;
+    // Collapsible settings section (threshold, system-NTP switch, update
+    // check, force jump, clear history). Default collapsed: the fixed
+    // header used to take half the screen and squeeze the records below.
+    private LinearLayout settingsContainer;
+    private static final String SETTINGS_EXPANDED_PREF = "diagnostics_settings_expanded";
     private String lastShownHtml;
     private int pendingScrollY = -1;
     private Button forceButton;
@@ -254,16 +256,50 @@ public final class TimeDiagnosticsActivity extends Activity {
         actions.addView(calibrateButton, calibrateParams);
         root.addView(actions, new LinearLayout.LayoutParams(-1, -2));
 
-        // Thin indeterminate bar shown while a refresh is running; the old page
-        // stays visible underneath instead of flashing white.
+        // Slim status row under the action row: a spinner plus "上次刷新
+        // HH:mm:ss" while a refresh runs, so it is obvious whether the tap
+        // did anything. The old page stays visible underneath instead of
+        // flashing white.
+        LinearLayout statusRow = new LinearLayout(this);
+        statusRow.setOrientation(LinearLayout.HORIZONTAL);
+        statusRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        statusRow.setPadding(dp(12), dp(2), dp(12), dp(2));
         refreshProgress = new ProgressBar(this, null,
-            android.R.attr.progressBarStyleHorizontal);
+            android.R.attr.progressBarStyleSmall);
         refreshProgress.setIndeterminate(true);
         refreshProgress.setVisibility(View.GONE);
-        LinearLayout.LayoutParams progressParams =
-            new LinearLayout.LayoutParams(-1, dp(3));
-        progressParams.setMargins(dp(12), 0, dp(12), 0);
-        root.addView(refreshProgress, progressParams);
+        statusRow.addView(refreshProgress, new LinearLayout.LayoutParams(-2, -2));
+        refreshStatusText = new TextView(this);
+        refreshStatusText.setText("上次刷新：—");
+        refreshStatusText.setTextSize(12);
+        refreshStatusText.setTextColor(Color.rgb(104, 117, 138));
+        refreshStatusText.setPadding(dp(8), 0, 0, 0);
+        statusRow.addView(refreshStatusText, new LinearLayout.LayoutParams(-2, -2));
+        root.addView(statusRow, new LinearLayout.LayoutParams(-1, -2));
+
+        // Settings (threshold, system-NTP switch, update check, force jump,
+        // clear history) live behind one collapsible header so the records
+        // below get most of the screen.
+        settingsContainer = new LinearLayout(this);
+        settingsContainer.setOrientation(LinearLayout.VERTICAL);
+        boolean settingsExpanded = getSharedPreferences("settings", MODE_PRIVATE)
+            .getBoolean(SETTINGS_EXPANDED_PREF, false);
+        settingsContainer.setVisibility(settingsExpanded ? View.VISIBLE : View.GONE);
+        Button settingsHeader = new Button(this);
+        settingsHeader.setText(settingsExpanded ? "设置 ▾" : "设置 ▸");
+        styleButton(settingsHeader, 0xFFE5EFF7, 0xFF365C78);
+        LinearLayout.LayoutParams settingsHeaderParams =
+            new LinearLayout.LayoutParams(-1, -2);
+        settingsHeaderParams.setMargins(dp(12), dp(4), dp(12), 0);
+        root.addView(settingsHeader, settingsHeaderParams);
+        settingsHeader.setOnClickListener(view -> {
+            boolean expanded = settingsContainer.getVisibility() != View.VISIBLE;
+            settingsContainer.setVisibility(expanded ? View.VISIBLE : View.GONE);
+            settingsHeader.setText(expanded ? "设置 ▾" : "设置 ▸");
+            getSharedPreferences("settings", MODE_PRIVATE).edit()
+                .putBoolean(SETTINGS_EXPANDED_PREF, expanded).apply();
+        });
+        root.addView(settingsContainer, new LinearLayout.LayoutParams(-1, -2));
 
         forceButton = new Button(this);
         forceButton.setText("强制跳改（可选授时源）");
@@ -271,14 +307,14 @@ public final class TimeDiagnosticsActivity extends Activity {
         forceButton.setEnabled(false);
         LinearLayout.LayoutParams forceParams = new LinearLayout.LayoutParams(-1, -2);
         forceParams.setMargins(dp(12), 0, dp(12), dp(4));
-        root.addView(forceButton, forceParams);
+        settingsContainer.addView(forceButton, forceParams);
 
         clearHistoryButton = new Button(this);
         clearHistoryButton.setText("清理历史记录和日志");
         styleButton(clearHistoryButton, 0xFFE5EFF7, 0xFF365C78);
         LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(-1, -2);
         clearParams.setMargins(dp(12), 0, dp(12), dp(4));
-        root.addView(clearHistoryButton, clearParams);
+        settingsContainer.addView(clearHistoryButton, clearParams);
 
         LinearLayout thresholdCard = new LinearLayout(this);
         thresholdCard.setOrientation(LinearLayout.VERTICAL);
@@ -289,7 +325,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         LinearLayout.LayoutParams thresholdCardParams =
             new LinearLayout.LayoutParams(-1, -2);
         thresholdCardParams.setMargins(dp(12), dp(2), dp(12), 0);
-        root.addView(thresholdCard, thresholdCardParams);
+        settingsContainer.addView(thresholdCard, thresholdCardParams);
 
         TextView thresholdLabel = new TextView(this);
         thresholdLabel.setText("自动改时门槛（全局回落值）");
@@ -341,7 +377,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         ntpCard.setElevation(dp(3));
         LinearLayout.LayoutParams ntpCardParams = new LinearLayout.LayoutParams(-1, -2);
         ntpCardParams.setMargins(dp(12), dp(8), dp(12), 0);
-        root.addView(ntpCard, ntpCardParams);
+        settingsContainer.addView(ntpCard, ntpCardParams);
         ntpSwitch = new Switch(this);
         ntpSwitch.setText("系统 NTP 走授时中心");
         ntpSwitch.setTextSize(14);
@@ -373,7 +409,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         updateCard.setElevation(dp(3));
         LinearLayout.LayoutParams updateCardParams = new LinearLayout.LayoutParams(-1, -2);
         updateCardParams.setMargins(dp(12), dp(8), dp(12), 0);
-        root.addView(updateCard, updateCardParams);
+        settingsContainer.addView(updateCard, updateCardParams);
         TextView updateTitle = new TextView(this);
         updateTitle.setText("应用更新");
         updateTitle.setTextSize(14);
@@ -1036,10 +1072,21 @@ public final class TimeDiagnosticsActivity extends Activity {
         return html;
     }
 
-    /** Thin indeterminate bar under the action row while a refresh is running. */
+    /** Status row under the action row while a refresh is running, plus the
+     * button label: "刷新中…" while running, "刷新" after, and the status
+     * text shows "正在刷新…" then "上次刷新 HH:mm:ss", so a tap visibly did
+     * something. Runs on the UI thread at every refresh start/finish. */
     private void setRefreshing(boolean refreshing) {
         if (refreshProgress != null) {
             refreshProgress.setVisibility(refreshing ? View.VISIBLE : View.GONE);
+        }
+        if (refreshStatusText != null) {
+            refreshStatusText.setText(refreshing ? "正在刷新…"
+                : "上次刷新 " + new SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+                    .format(new Date()));
+        }
+        if (refreshButton != null) {
+            refreshButton.setText(refreshing ? "刷新中…" : "刷新");
         }
     }
 
@@ -1546,7 +1593,6 @@ public final class TimeDiagnosticsActivity extends Activity {
         Sample telephony = findLatestSample(timeDump, "TelephonyTimeSuggestion");
         Sample network = findLatestSample(timeDump, "NetworkTimeSuggestion");
         long networkUncertainty = findNetworkUncertainty(timeDump);
-        Sample gnssServiceSample = findGnssServiceSample(gnssDump);
         List<ForceOption> options = new ArrayList<>();
         addForceOption(options, "GNSS 卫星", gnss, nowElapsed, systemUnix, -1);
         addForceOption(options, "基站 NITZ", telephony, nowElapsed, systemUnix, -1);
@@ -1576,51 +1622,27 @@ public final class TimeDiagnosticsActivity extends Activity {
         ResolvedSample networkResolved =
             resolveSamples(timeDump, "NetworkTimeSuggestion", nowElapsed);
         Sample gnssDisplay = gnssResolved.sample;
-        Sample telephonyDisplay = telephonyResolved.sample;
         Sample networkDisplay = networkResolved.sample;
-        int telephonySlot = findTelephonySlotIndex(timeDump, telephonyDisplay);
-        boolean multiSlot = countTelephonySlots(timeDump) > 1;
-        String telephonySlotNote = telephonySlot >= 0
-            ? "卡槽 " + telephonySlot + (multiSlot ? "（双卡：仅显示该卡槽样本）" : "")
-            : (multiSlot ? "双卡：未能确认样本卡槽" : null);
         // NITZ calibration state, published by the hook as debug.nitz.calibration:
         // "calibrated|<offset>|<samples>|<carrier>",
         // "uncalibrated|<samples>|<carrier>" while still learning, or the older
         // "uncalibrated|<carrier>" (no count). Empty means the hook has not
         // published anything yet (no NITZ sample seen since boot, or an older
-        // module build without calibration).
+        // module build without calibration). Shown as one line in the summary
+        // card below; the per-source detail cards were removed from the page
+        // (the full detail lives in the copy log).
         NitzCalibrationDisplay nitzCalibration =
             parseNitzCalibrationStatus(nitzCalibrationStatus);
         String nitzCalibrationNote = nitzCalibration == null ? null
             : nitzCalibration.displayText();
-        if (nitzCalibrationNote != null) {
-            telephonySlotNote = telephonySlotNote == null ? nitzCalibrationNote
-                : telephonySlotNote + "；" + nitzCalibrationNote;
-        }
-        long gnssUncertainty = gnssDisplay != null && nowElapsed >= 0
-            ? uncertaintyFor("GNSS 卫星",
-                Math.max(0L, nowElapsed - gnssDisplay.elapsedRealtimeMillis), -1) : -1L;
-        boolean nitzCalibrated = nitzCalibration != null && nitzCalibration.calibrated;
-        long telephonyUncertainty = telephonyDisplay != null && nowElapsed >= 0
-            ? nitzUncertainty(
-                Math.max(0L, nowElapsed - telephonyDisplay.elapsedRealtimeMillis),
-                nitzCalibrated) : -1L;
-        long networkTotalUncertainty = networkDisplay != null && nowElapsed >= 0
-            ? uncertaintyFor("网络 NTP",
-                Math.max(0L, nowElapsed - networkDisplay.elapsedRealtimeMillis),
-                networkUncertainty) : -1L;
         html.append("<div class='card root-ok'><div class='state'>Root 已授权 · 系统数据可读取</div></div>")
             .append(moduleStatusCard(hookActive, gnssService))
             .append(detectionWarningsCard(gnssResolved, telephonyResolved, networkResolved,
                 gnssDisplay, networkDisplay, nowElapsed))
             .append(gnssSyncCard(gnssDisplay, nowElapsed, systemUnix, autoEnabled, priorities,
                 timeDump, networkDisplay, calibrationState, calibrationStartElapsed))
-            .append(gnssTrendCard(trendPoints, nowElapsed))
             .append(driftCard(nowElapsed))
-            .append(beijingTimeCard(networkDisplay, networkUncertainty, nowElapsed, systemUnix))
-            .append(ntscTimeCard(ntscResult, systemNtp, timeDump, nowElapsed))
-            .append(calibrationCard(calibrationState, calibrationDetail, calibrationTime))
-            .append(forceCard(forceState, forceDetail, forceTime));
+            .append(ntscTimeCard(ntscResult, systemNtp, timeDump, nowElapsed));
         html.append("<div class='card'><div class='summary'>自动授时：<b>")
             .append(escape(autoEnabled)).append("</b>　优先级：<b>")
             .append(escape(priorities)).append("</b></div>")
@@ -1642,25 +1664,14 @@ public final class TimeDiagnosticsActivity extends Activity {
             html.append("（模块设定值；system_server 生效待确认；dump 当前值 ")
                 .append(dumpedThreshold).append(" ms）");
         }
-        html.append(" · 当前时钟 ").append(systemUnix).append(" ms</div>")
-            .append(sourceCard("GNSS 卫星", gnssDisplay, nowElapsed, systemUnix,
-                NitzPriorityHook.GNSS_CLOCK_UPDATE_THRESHOLD_MILLIS,
-                gnssServiceSample == null ? null : nowElapsed - gnssServiceSample.elapsedRealtimeMillis,
-                gnssUncertainty, null))
-            .append(sourceCard("基站 NITZ", telephonyDisplay, nowElapsed, systemUnix,
-                NitzPriorityHook.TELEPHONY_CLOCK_UPDATE_THRESHOLD_MILLIS,
-                null, telephonyUncertainty, telephonySlotNote))
-            .append(sourceCard("网络 NTP", networkDisplay, nowElapsed, systemUnix,
-                NitzPriorityHook.NETWORK_CLOCK_UPDATE_THRESHOLD_MILLIS,
-                null, networkTotalUncertainty, null))
-            .append(rawGnssSourceCard(rawGnss, nowElapsed, systemUnix));
-
+        html.append(" · 当前时钟 ").append(systemUnix).append(" ms</div>");
+        if (nitzCalibrationNote != null) {
+            html.append("<div class='small'>基站校准：")
+                .append(escape(nitzCalibrationNote)).append("</div>");
+        }
         html.append("</div>")
             .append(clockActionCard(timeDump, nowElapsed))
-            .append("<div class='note'>“手机时钟已与卫星时间同步”按最近 GNSS 样本（不超过 10 分钟）与手机时钟的外推差值判定，判定容差随样本年龄与不确定度动态计算，不再是固定 ±100 毫秒；仅收到新 GNSS 建议不等于时钟已调整。实际是否跳变会单独显示。所有毫秒差值均为“差值 ± 不确定度”的估算，不是实测绝对误差。强制跳改仅在选择来源、预览目标并二次确认后执行。</div>")
-            .append("<details class='details'><summary>查看详细授时日志</summary><pre>")
-            .append(escape(extractTimeDetectorExcerpt(timeDump) + "\n=== GNSS service ===\n" + gnssDump))
-            .append("</pre></details><div class='foot'>授时诊断 · 数据由 Android 系统服务提供<br>作者：酷安 R1263599071</div>")
+            .append("<div class='foot'>授时诊断 · 数据由 Android 系统服务提供<br>作者：酷安 R1263599071</div>")
             .append("</div></body></html>");
         return html.toString();
     }
@@ -3133,38 +3144,6 @@ public final class TimeDiagnosticsActivity extends Activity {
      * elapsed/unix pair so two carriers are never mixed into one reading.
      * Returns -1 when the dump does not carry a slot index for this sample.
      */
-    private static int findTelephonySlotIndex(String dump, Sample sample) {
-        if (sample == null) return -1;
-        Matcher matcher = TELEPHONY_SLOT_PATTERN.matcher(dump == null ? "" : dump);
-        while (matcher.find()) {
-            try {
-                long elapsed = Long.parseLong(matcher.group(2));
-                long unix = Long.parseLong(matcher.group(3));
-                if (elapsed == sample.elapsedRealtimeMillis
-                        && unix == sample.unixEpochTimeMillis) {
-                    return Integer.parseInt(matcher.group(1));
-                }
-            } catch (NumberFormatException ignored) {
-                // Ignore malformed dump entries.
-            }
-        }
-        return -1;
-    }
-
-    /** Number of distinct SIM slots with a telephony suggestion in this dump. */
-    private static int countTelephonySlots(String dump) {
-        Matcher matcher = TELEPHONY_SLOT_PATTERN.matcher(dump == null ? "" : dump);
-        java.util.Set<Integer> slots = new java.util.HashSet<>();
-        while (matcher.find()) {
-            try {
-                slots.add(Integer.parseInt(matcher.group(1)));
-            } catch (NumberFormatException ignored) {
-                // Ignore malformed dump entries.
-            }
-        }
-        return slots.size();
-    }
-
     private static Sample findLatestSample(String dump, String className) {
         Matcher matcher = SUGGESTION_PATTERN.matcher(dump == null ? "" : dump);
         Sample latest = null;
