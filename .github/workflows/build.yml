@@ -1,5 +1,6 @@
 name: Build APK
-
+permissions:
+  contents: write
 on:
   push:
     branches: [main, master]
@@ -56,3 +57,13 @@ jobs:
         with:
           name: satellite-time-apk
           path: app/build/outputs/apk/release/*.apk
+      - name: Publish APK to rolling release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: latest
+          name: Latest build
+          allowUpdates: true
+          replacesArtifacts: true
+          makeLatest: true
+          artifacts: app/build/outputs/apk/release/*.apk
+          token: ${{ secrets.GITHUB_TOKEN }}
