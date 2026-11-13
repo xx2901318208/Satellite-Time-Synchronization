@@ -65,12 +65,14 @@ final class NitzCalibrator {
     // extrapolation error stays small (100 ppm * 60 s = 6 ms).
     private static final long REFERENCE_MAX_AGE_MILLIS = 60_000L;
     // A reference whose own uncertainty exceeds this does not teach.
-    private static final long REFERENCE_MAX_UNCERTAINTY_MILLIS = 50L;
+    private static final long REFERENCE_MAX_UNCERTAINTY_MILLIS = 100L;
     // Base uncertainty assumed for a reference when the suggestion carries no
     // reported uncertainty (GNSS suggestions carry none; network suggestions on
-    // some builds report mUncertaintyMillis). GNSS is tens of ms, the NTP
-    // median is +/-10-30 ms per the project's NTSC findings; both stay under
-    // the 50 ms gate once the small drift budget is added.
+    // some builds report mUncertaintyMillis). GNSS is tens of ms and stays well
+    // under the gate; network NTP on the reference device reports 56-58 ms, so
+    // the gate is 100 ms to admit honest network references while still
+    // excluding NITZ-grade uncertainty. The median-of-5 and spread checks still
+    // guard learning quality.
     private static final long GNSS_REFERENCE_BASE_UNCERTAINTY_MILLIS = 20L;
     private static final long NETWORK_REFERENCE_BASE_UNCERTAINTY_MILLIS = 30L;
     private static final long DRIFT_BUDGET_PPM = 100L;

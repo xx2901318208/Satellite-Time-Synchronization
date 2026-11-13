@@ -941,7 +941,13 @@ public final class TimeDiagnosticsActivity extends Activity {
         log.append("应用版本：").append(appVersion()).append("\n");
         log.append("本日志只含授时诊断数据，不含密码、口令或密钥。\n");
 
-        long nowElapsed = s.collectedElapsedMillis;
+        // systemUnix is read from the time dump, so its elapsed must come from
+        // the same dump: pairing it with the snapshot's collected elapsed
+        // inflates every extrapolated offset by the dumpsys runtime (~166 ms
+        // on device). Fall back to the collected elapsed only when the dump
+        // carries no elapsed line.
+        long nowElapsed = parseLong(ELAPSED_PATTERN, s.timeDump, -1);
+        if (nowElapsed < 0) nowElapsed = s.collectedElapsedMillis;
         long systemUnix = parseLong(SYSTEM_TIME_PATTERN, s.timeDump, -1);
         String autoEnabled = parseString(AUTO_ENABLED_PATTERN, s.timeDump, "unknown");
         String priorities = parseString(PRIORITIES_PATTERN, s.timeDump, "unknown");
