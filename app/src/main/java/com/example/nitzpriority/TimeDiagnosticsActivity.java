@@ -325,41 +325,6 @@ public final class TimeDiagnosticsActivity extends Activity {
         thresholdHint.setPadding(dp(4), dp(4), dp(4), dp(2));
         thresholdCard.addView(thresholdHint, new LinearLayout.LayoutParams(-1, -2));
 
-        // Periodic sync switch: every 5 minutes (15 on low battery) while the
-        // screen is on, refresh the NTSC reference and request one GNSS sample,
-        // so the clock does not drift unchecked between manual refreshes.
-        // The tick itself runs in FloatingClockService, so background sync only
-        // happens while the floating clock is enabled; opening this page already
-        // samples about once a minute through its own 60 s refresh.
-        LinearLayout syncCard = new LinearLayout(this);
-        syncCard.setOrientation(LinearLayout.VERTICAL);
-        syncCard.setPadding(dp(14), dp(10), dp(14), dp(10));
-        syncCard.setBackground(glassCardBackground());
-        syncCard.setElevation(dp(3));
-        LinearLayout.LayoutParams syncCardParams = new LinearLayout.LayoutParams(-1, -2);
-        syncCardParams.setMargins(dp(12), dp(8), dp(12), 0);
-        root.addView(syncCard, syncCardParams);
-        Switch syncSwitch = new Switch(this);
-        syncSwitch.setText("定期同步（每 5 分钟）");
-        syncSwitch.setTextSize(14);
-        syncSwitch.setTypeface(null, android.graphics.Typeface.BOLD);
-        syncSwitch.setTextColor(Color.rgb(37, 48, 66));
-        syncSwitch.setChecked(getSharedPreferences(ClockDriftEstimator.PREFS_NAME,
-            MODE_PRIVATE).getBoolean(ClockDriftEstimator.KEY_PERIODIC_SYNC_ENABLED, true));
-        syncCard.addView(syncSwitch, new LinearLayout.LayoutParams(-1, -2));
-        TextView syncHint = new TextView(this);
-        syncHint.setText("亮屏时每 5 分钟查一次授时中心 NTP 并请求一次 GNSS 样本；低电量时降为 15 分钟。仅在悬浮时钟开启时后台运行。漂移估计随样本过期失效，关掉后不再定期同步。");
-        syncHint.setTextSize(12);
-        syncHint.setTextColor(Color.rgb(104, 117, 138));
-        syncHint.setPadding(dp(4), dp(4), dp(4), dp(2));
-        syncCard.addView(syncHint, new LinearLayout.LayoutParams(-1, -2));
-        syncSwitch.setOnCheckedChangeListener((buttonView, checked) -> {
-            getSharedPreferences(ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE).edit()
-                .putBoolean(ClockDriftEstimator.KEY_PERIODIC_SYNC_ENABLED, checked).apply();
-            Toast.makeText(this, checked ? "定期同步已开启" : "定期同步已关闭",
-                Toast.LENGTH_SHORT).show();
-        });
-
         // System-NTP server switch: when on, the module makes the system
         // network time service try ntp.ntsc.ac.cn first and fall back to
         // time.android.com (the framework's own multi-server list, tried in
@@ -911,8 +876,8 @@ public final class TimeDiagnosticsActivity extends Activity {
             // Drift samples come from the same refresh that draws the page:
             // the fresh GNSS trend point and the independent NTSC result are
             // both (reference - phone) offsets at an elapsed instant. The
-            // estimator only displays drift and triggers an early sync; it
-            // never steps the clock on a prediction.
+            // estimator only displays drift; it never steps the clock on
+            // a prediction.
             android.content.SharedPreferences settingsPrefs = getSharedPreferences(
                 ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE);
             TrendPoint newTrendPoint = recordGnssTrendPoint(timeDump);
@@ -1330,9 +1295,6 @@ public final class TimeDiagnosticsActivity extends Activity {
                 .append(Math.abs(predictedOffset)).append(" 毫秒 ±")
                 .append(predictedError).append(" 毫秒\n");
         }
-        log.append("定期同步：")
-            .append(ClockDriftEstimator.isPeriodicSyncEnabled(settingsPrefs)
-                ? "开启（亮屏时每 5 分钟，低电量 15 分钟）" : "已关闭").append("\n");
         log.append("校准状态：").append(s.calibrationState)
             .append("（").append(s.calibrationDetail).append("）");
         if (s.calibrationTime > 0) {
@@ -2289,11 +2251,7 @@ public final class TimeDiagnosticsActivity extends Activity {
         android.content.SharedPreferences prefs = getSharedPreferences(
             ClockDriftEstimator.PREFS_NAME, MODE_PRIVATE);
         StringBuilder card = new StringBuilder("<div class='card'><div class='name'>时钟漂移估计</div>")
-            .append("<div class='meta'>用最近 1 小时内的 GNSS / 授时中心偏移样本做线性回归；只用于显示与提前同步，不直接改时钟。</div>");
-        boolean periodicOn = ClockDriftEstimator.isPeriodicSyncEnabled(prefs);
-        card.append("<div class='small'>定期同步：")
-            .append(periodicOn ? "开启（亮屏时每 5 分钟，低电量 15 分钟）" : "已关闭")
-            .append("</div>");
+            .append("<div class='meta'>用最近 1 小时内的 GNSS / 授时中心偏移样本做线性回归；只用于显示，不直接改时钟。样本来自诊断页刷新与 GNSS 校准，没有后台同步。</div>");
         if (nowElapsed < 0) {
             return card.append("<div class='trend-empty'>暂无系统授时数据，无法估计漂移。</div></div>")
                 .toString();
@@ -2304,11 +2262,11 @@ public final class TimeDiagnosticsActivity extends Activity {
             ClockDriftEstimator.Summary summary =
                 ClockDriftEstimator.summary(prefs, nowElapsed);
             if (summary.newestAgeMillis < 0) {
-                card.append("<div class='trend-empty'>暂无漂移样本；保持诊断页打开或开启定期同步，采集到 3 个点（跨度 10 分钟以上）后显示。</div>");
+                card.append("<div class='trend-empty'>暂无漂移样本；保持诊断页打开，采集到 3 个点（跨度 10 分钟以上）后显示。</div>");
             } else if (summary.newestAgeMillis > ClockDriftEstimator.MAX_SAMPLE_AGE_MILLIS) {
                 card.append("<div class='trend-empty'>漂移估计已过期：最近样本在 ")
                     .append(escape(formatAge(summary.newestAgeMillis)))
-                    .append("前，超过 1 小时无新鲜样本。刷新一次或等定期同步采到新样本。</div>");
+                    .append("前，超过 1 小时无新鲜样本。刷新一次可采集新样本。</div>");
             } else {
                 card.append("<div class='trend-empty'>采集中：已收 ")
                     .append(summary.pointCount).append(" 个点，跨度 ")
@@ -2328,8 +2286,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append("；按此推算，当前误差约 ")
             .append(predictedOffset >= 0 ? "落后 " : "领先 ")
             .append(Math.abs(predictedOffset)).append(" 毫秒 ±")
-            .append(predictedError).append(" 毫秒。</div>")
-            .append("<div class='small'>预测误差超过网络门槛（50ms）时，定期同步会提前触发一次；预测值本身不用于改时钟。</div>");
+            .append(predictedError).append(" 毫秒。</div>");
         return card.append("</div>").toString();
     }
 
@@ -2869,7 +2826,7 @@ public final class TimeDiagnosticsActivity extends Activity {
             .append("原始 GNSS 时钟</div>");
         if (raw == null || !raw.available) {
             card.append("<div class='meta'>尚无原始测量记录</div>")
-                .append("<div class='small'>需开启定位后由校准页或定期同步采集；")
+                .append("<div class='small'>需开启定位后由校准页采集；")
                 .append("系统建议优先，原始时钟只作后备。</div>")
                 .append("</div><div class='value none'>暂无</div></div>");
             return card.toString();

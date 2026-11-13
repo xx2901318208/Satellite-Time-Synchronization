@@ -11,17 +11,15 @@ import java.util.List;
  *
  * <p>An offset sample is {@code referenceUnix - phoneUnix} at one
  * {@code elapsedRealtime} instant: positive means the phone lags the
- * reference. Samples come from two existing flows, never from a new
- * pipeline: GNSS trend points recorded by the diagnostics page and
- * NTSC NTP results (diagnostics page refresh and the periodic sync
- * tick). A linear regression over the samples estimates the crystal
- * drift rate in ppm.
+ * reference. Samples come from the diagnostics page refresh (its GNSS
+ * trend point and its NTSC NTP result) and from GNSS calibration runs.
+ * There is no background sync: the floating clock is display-only and
+ * collects nothing. A linear regression over the samples estimates the
+ * crystal drift rate in ppm.
  *
- * <p>The estimate is used for exactly two things, and nothing else:
- * (1) the diagnostics page shows "drift +X ppm, predicted current
- * error about +/-Y ms"; (2) when the predicted error at the next
- * scheduled sync exceeds the network threshold, the periodic sync
- * fires early. The predicted value is NEVER used to step the clock:
+ * <p>The estimate is used for exactly one thing, and nothing else: the
+ * diagnostics page shows "drift +X ppm, predicted current error about
+ * +/-Y ms". The predicted value is NEVER used to step the clock:
  * a regression can be wrong (bad samples, a temperature change, a
  * clock step) and a wrong prediction applied to the clock would move
  * the clock the wrong way with no reference to check against.
@@ -40,8 +38,6 @@ final class ClockDriftEstimator {
     /** SharedPreferences file shared with the diagnostics page ("settings"). */
     static final String PREFS_NAME = "settings";
     static final String SAMPLES_KEY = "drift_samples";
-    /** Periodic-sync switch, visible on the diagnostics page. Default on. */
-    static final String KEY_PERIODIC_SYNC_ENABLED = "periodic_sync_enabled";
     static final String SOURCE_GNSS = "gnss";
     static final String SOURCE_NTP = "ntp";
 
@@ -120,10 +116,6 @@ final class ClockDriftEstimator {
             this.spanMillis = spanMillis;
             this.newestAgeMillis = newestAgeMillis;
         }
-    }
-
-    static boolean isPeriodicSyncEnabled(SharedPreferences prefs) {
-        return prefs.getBoolean(KEY_PERIODIC_SYNC_ENABLED, true);
     }
 
     /**
@@ -276,32 +268,13 @@ final class ClockDriftEstimator {
     /**
      * Predicted current error budget: drift growth since the last sample
      * plus that sample's own uncertainty. This is the "+/-Y ms" shown
-     * next to the ppm figure, and the quantity compared against a
-     * source threshold to decide an early sync.
+     * next to the ppm figure.
      */
     static long projectedErrorMillis(Estimate estimate, long nowElapsed) {
         if (estimate == null) return -1L;
         double age = Math.max(0L, nowElapsed - estimate.lastElapsedRealtimeMillis);
         return Math.round(Math.abs(estimate.ppm) * age / 1_000_000.0)
             + estimate.lastUncertaintyMillis;
-    }
-
-    /**
-     * Predicted drift growth alone since the last sample: |ppm| * age,
-     * WITHOUT that sample's measurement uncertainty. The periodic sync's
-     * early-sync decision uses this, not {@link #projectedErrorMillis}:
-     * uncertainty is measurement noise, not drift, and it alone — NTSC
-     * RTT/2 is routinely 100-300 ms on device, raw GNSS 100 ms — already
-     * exceeds the 50 ms network threshold, so comparing the full error
-     * budget would fire early sync on almost every tick, collapsing the
-     * 5-minute interval to 60 seconds and keeping GPS running nearly
-     * non-stop indoors. projectedErrorMillis keeps its uncertainty term
-     * for display (the "+/-Y ms" shown next to the ppm figure).
-     */
-    static long projectedDriftMillis(Estimate estimate, long nowElapsed) {
-        if (estimate == null) return -1L;
-        double age = Math.max(0L, nowElapsed - estimate.lastElapsedRealtimeMillis);
-        return Math.round(Math.abs(estimate.ppm) * age / 1_000_000.0);
     }
 
     /** Store contents for the "warming up / expired" display. */
