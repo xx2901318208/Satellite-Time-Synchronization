@@ -2101,8 +2101,11 @@ public final class TimeDiagnosticsActivity extends Activity {
                     || line.startsWith("Network suggestion history:"))) break;
             if (!inSection) continue;
 
-            Matcher originMatcher = CLOCK_SET_ORIGIN_PATTERN.matcher(line);
-            if (!originMatcher.find()) continue;
+            Matcher setMatcher = CLOCK_SET_ORIGIN_PATTERN.matcher(line);
+            Matcher confidenceMatcher = CONFIDENCE_ORIGIN_PATTERN.matcher(line);
+            boolean isSetLine = setMatcher.find();
+            boolean isConfidenceLine = !isSetLine && confidenceMatcher.find();
+            if (!isSetLine && !isConfidenceLine) continue;
             Matcher elapsedMatcher = CHANGE_LOG_ELAPSED_PATTERN.matcher(line);
             if (!elapsedMatcher.find()) continue;
             try {
@@ -2114,7 +2117,24 @@ public final class TimeDiagnosticsActivity extends Activity {
                     ? 0.0 : Double.parseDouble(elapsedMatcher.group(3));
                 long elapsed = hours * 3_600_000L + minutes * 60_000L
                     + Math.round(seconds * 1_000.0);
-                events.add(new ClockSetEvent(originMatcher.group(1), elapsed));
+                String origin = isSetLine ? setMatcher.group(1) : confidenceMatcher.group(1);
+                // A confidence line is only a real clock set when the clock
+                // values it reports actually moved (same rule as
+                // findClockActionEvents): the wording alone does not decide.
+                // Without this, a real step recorded only on a confidence
+                // line (e.g. the telephony -892 ms set at 2026-11-13 11:37:30)
+                // is invisible to the calibration card, while a no-op
+                // confidence update would falsely report a set.
+                if (!isSetLine) {
+                    long oldMillis = parseLong(OLD_CLOCK_MILLIS_PATTERN, line, -1L);
+                    long newMillis = parseLong(NEW_CLOCK_MILLIS_PATTERN, line, -1L);
+                    if (oldMillis < 0 || newMillis < 0
+                            || Math.abs(newMillis - oldMillis)
+                                <= CLOCK_CHANGE_TOLERANCE_MILLIS) {
+                        continue;
+                    }
+                }
+                events.add(new ClockSetEvent(origin, elapsed));
             } catch (NumberFormatException ignored) {
                 // Ignore malformed or vendor-specific time-change records.
             }
