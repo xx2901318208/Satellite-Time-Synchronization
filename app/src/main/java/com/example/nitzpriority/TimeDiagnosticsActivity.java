@@ -652,7 +652,7 @@ public final class TimeDiagnosticsActivity extends Activity {
                         .getBoolean(NTP_NTSC_ENABLED_PREF, false));
                 Toast.makeText(this, success
                         ? (checked
-                            ? "系统 NTP 已改为优先授时中心（ntp.ntsc.ac.cn，失败回落 time.android.com）；下次系统 NTP 轮询时生效，切换飞行模式或重连网络可触发轮询"
+                            ? "系统 NTP 已改为优先授时中心（ntp.ntsc.ac.cn，失败回落 time.android.com）；下次系统 NTP 轮询时生效，Termux 里跑 force_refresh 可立即触发一次轮询"
                             : "系统 NTP 已恢复设备默认服务器；下次系统 NTP 轮询时生效")
                         : "设置失败，请检查 Root 授权与系统属性权限",
                     Toast.LENGTH_LONG).show();
