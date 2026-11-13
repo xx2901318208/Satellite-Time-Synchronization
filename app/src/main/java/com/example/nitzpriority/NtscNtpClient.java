@@ -9,7 +9,9 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Independent NTP reference client for the National Time Service Center
@@ -36,7 +38,11 @@ final class NtscNtpClient {
      * Only ntp.ntsc.ac.cn is listed: the numbered names ntp1/ntp2/ntp3 have
      * no DNS records at all (verified on device 2026-11-12: ntp.ntsc.ac.cn
      * resolves, ntp1/ntp2/ntp3 all return "unknown host"), and the official
-     * NTSC announcement only ever published ntp.ntsc.ac.cn.
+     * NTSC announcement only ever published ntp.ntsc.ac.cn. Each domain is
+     * resolved with getAllByName and every returned address is tried: the
+     * resolver returns several (on device 2026-11-13: 113.141.164.39,
+     * 113.141.164.38, 1.82.219.234), and the old getByName call only ever
+     * tried the first one, which was the dead .38.
      */
     static final String[] NTSC_HOSTS = {
         "ntp.ntsc.ac.cn",
@@ -78,12 +84,15 @@ final class NtscNtpClient {
     static final int MAX_CONSECUTIVE_TIMEOUTS_PER_SERVER = 2;
     /**
      * Whole query (all servers) must finish inside this budget. Worst case
-     * is 4 NTSC candidates x 6 s (2 x 3 s timeouts each) = 24 s plus ~1 s for
-     * the pool fallback, so 26 s: at 15 s the last direct IP never got tried
-     * (domain 6 s + first IP 6 s left 3 s < 4 s gate), and 21 s would still
-     * leave it untried once the fourth candidate was added.
+     * is 3 DNS-resolved addresses x 6 s (2 x 3 s timeouts each) = 18 s plus
+     * the 2 remaining direct IPs x 6 s = 12 s plus ~1 s for the pool
+     * fallback, so 31 s: the domain's addresses are all tried before the
+     * direct-IP list, and a direct IP already tried via DNS is skipped.
+     * At 15 s the last direct IP never got tried (domain 6 s + first IP
+     * 6 s left 3 s < 4 s gate); at 26 s the third DNS address would have
+     * pushed the last direct IP out again.
      */
-    static final long QUERY_DEADLINE_MILLIS = 26_000;
+    static final long QUERY_DEADLINE_MILLIS = 31_000;
     /** A cached result younger than this is reused instead of querying again. */
     static final long CACHE_TTL_MILLIS = 60_000;
     /** A result older than this is shown as expired, never as fresh. */
@@ -199,35 +208,36 @@ final class NtscNtpClient {
     }
 
     /**
-     * Tries, in order: the NTSC domain, the NTSC direct IPs (when the domain
-     * failed DNS, or resolved but never answered), then the pool fallback.
-     * An IP is worth trying even when the name resolved: DNS may return a
-     * different address than the documented ones (observed on device
-     * 2026-11-12: ntp.ntsc.ac.cn resolves to 113.141.164.38, which answers
-     * ICMP but not NTP), and the DNS address may not serve NTP while the
-     * documented addresses do. Each IP attempt is skipped when under 4 s of
-     * the deadline remain, so the pool fallback still gets a chance. A
-     * per-host failure never aborts the query: DNS failure, timeout, and
-     * too-few-samples are recorded per host and the next host is tried. Only
-     * when every name failed DNS does the result say so; a timeout is never
-     * reported as a DNS failure.
+     * Tries, in order: the NTSC domain (every address it resolves to, via
+     * getAllByName), the NTSC direct IPs not already tried via DNS (when the
+     * domain failed DNS, or resolved but no address answered), then the pool
+     * fallback. An IP is worth trying even when the name resolved: DNS may
+     * return a different address than the documented ones (observed on
+     * device 2026-11-12: ntp.ntsc.ac.cn resolves to 113.141.164.38, which
+     * answers ICMP but not NTP), and the DNS address may not serve NTP while
+     * the documented addresses do. Each IP attempt is skipped when under 4 s
+     * of the deadline remain, so the pool fallback still gets a chance. A
+     * per-address failure never aborts the query: DNS failure, timeout, and
+     * too-few-samples are recorded per address and the next address is tried.
+     * Only when every name failed DNS does the result say so; a timeout is
+     * never reported as a DNS failure.
      */
     private static Result queryFresh() {
         long deadlineElapsed = SystemClock.elapsedRealtime() + QUERY_DEADLINE_MILLIS;
         String lastError = "未知错误";
         StringBuilder attempts = new StringBuilder();
+        Set<String> triedAddresses = new HashSet<>();
         int dnsFailures = 0;
         boolean ntpUnanswered = false;
         for (String host : NTSC_HOSTS) {
             try {
-                Result result = queryServer(host, false, false, deadlineElapsed);
+                Result result = queryServer(host, false, false, deadlineElapsed,
+                    triedAddresses, attempts);
                 if (result != null) {
-                    recordAttempt(attempts, host, "成功");
                     return withAttempts(result, attempts.toString());
                 }
                 ntpUnanswered = true;
                 lastError = "服务器 " + host + " 有效样本不足 3 个";
-                recordAttempt(attempts, host, "有效样本不足 3 个");
             } catch (UnknownHostException e) {
                 // One dead name must not kill the whole query: ntp1.ntsc.ac.cn
                 // has no DNS record at all, while the other names may resolve
@@ -238,10 +248,8 @@ final class NtscNtpClient {
             } catch (SocketTimeoutException e) {
                 ntpUnanswered = true;
                 lastError = "服务器 " + host + " 超时无响应";
-                recordAttempt(attempts, host, "超时无响应");
             } catch (Exception e) {
                 lastError = "服务器 " + host + " 查询失败：" + e.getMessage();
-                recordAttempt(attempts, host, "查询失败：" + e.getMessage());
             }
             if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
                 return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
@@ -255,6 +263,10 @@ final class NtscNtpClient {
         // remain, so the pool fallback still gets its chance.
         if (dnsFailures > 0 || ntpUnanswered) {
             for (String directIp : NTSC_DIRECT_IPS) {
+                if (triedAddresses.contains(directIp)) {
+                    recordAttempt(attempts, directIp, "域名解析中已试过，跳过");
+                    continue;
+                }
                 long remainingMillis = deadlineElapsed - SystemClock.elapsedRealtime();
                 if (remainingMillis < 4000) {
                     recordAttempt(attempts, directIp,
@@ -262,23 +274,19 @@ final class NtscNtpClient {
                     break;
                 }
                 try {
-                    Result result = queryServer(directIp, false, true, deadlineElapsed);
+                    Result result = queryServer(directIp, false, true, deadlineElapsed,
+                        triedAddresses, attempts);
                     if (result != null) {
-                        recordAttempt(attempts, directIp, "成功");
                         return withAttempts(result, attempts.toString());
                     }
                     lastError = "授时中心 IP 直连 " + directIp + " 有效样本不足 3 个";
-                    recordAttempt(attempts, directIp, "有效样本不足 3 个");
                 } catch (UnknownHostException e) {
                     // A literal IP never needs DNS; treat it as unreachable.
                     lastError = "授时中心 IP 直连 " + directIp + " 无法访问";
-                    recordAttempt(attempts, directIp, "无法访问");
                 } catch (SocketTimeoutException e) {
                     lastError = "授时中心 IP 直连 " + directIp + " 超时无响应";
-                    recordAttempt(attempts, directIp, "超时无响应");
                 } catch (Exception e) {
                     lastError = "授时中心 IP 直连 " + directIp + " 查询失败：" + e.getMessage();
-                    recordAttempt(attempts, directIp, "查询失败：" + e.getMessage());
                 }
                 if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
                     return failure("查询超时（超过 " + (QUERY_DEADLINE_MILLIS / 1000)
@@ -287,23 +295,20 @@ final class NtscNtpClient {
             }
         }
         try {
-            Result result = queryServer(FALLBACK_HOST, true, false, deadlineElapsed);
+            Result result = queryServer(FALLBACK_HOST, true, false, deadlineElapsed,
+                triedAddresses, attempts);
             if (result != null) {
-                recordAttempt(attempts, FALLBACK_HOST, "成功");
                 return withAttempts(result, attempts.toString());
             }
             lastError = "服务器 " + FALLBACK_HOST + " 有效样本不足 3 个";
-            recordAttempt(attempts, FALLBACK_HOST, "有效样本不足 3 个");
         } catch (UnknownHostException e) {
             dnsFailures++;
             lastError = "服务器 " + FALLBACK_HOST + " DNS 解析失败";
             recordAttempt(attempts, FALLBACK_HOST, "DNS 解析失败");
         } catch (SocketTimeoutException e) {
             lastError = "服务器 " + FALLBACK_HOST + " 超时无响应";
-            recordAttempt(attempts, FALLBACK_HOST, "超时无响应");
         } catch (Exception e) {
             lastError = "服务器 " + FALLBACK_HOST + " 查询失败：" + e.getMessage();
-            recordAttempt(attempts, FALLBACK_HOST, "查询失败：" + e.getMessage());
         }
         if (dnsFailures == NTSC_HOSTS.length + 1) {
             return failure("DNS 解析失败：全部服务器域名均无法解析，请检查网络",
@@ -313,44 +318,63 @@ final class NtscNtpClient {
     }
 
     /**
-     * Samples one host up to {@link #SAMPLES_PER_SERVER} times. Returns a
-     * successful result, or null when this host cannot produce enough valid
-     * samples (the caller then tries the next host). Throws
+     * Samples one host up to {@link #SAMPLES_PER_SERVER} times per resolved
+     * address. Returns a successful result, or null when no resolved address
+     * can produce enough valid samples (the caller then tries the next host).
+     * Every address the name resolves to is tried ({@code getAllByName}),
+     * not just the first: the resolver may return several, and the first one
+     * may be the dead one (observed on device 2026-11-13: ntp.ntsc.ac.cn
+     * resolves to 113.141.164.39, 113.141.164.38 and 1.82.219.234, while the
+     * old getByName call only ever tried .38). Addresses already tried via
+     * an earlier host are skipped through {@code triedAddresses} so a direct
+     * IP is never re-tried after DNS already returned it. Each address's
+     * outcome is recorded in {@code attempts}. Throws
      * {@link UnknownHostException} / {@link SocketTimeoutException} so the
      * caller can tell DNS failure apart from plain timeouts. {@code host} may
      * be a domain or a literal IP; the sampling, median, and validation logic
      * is identical either way.
      */
     private static Result queryServer(String host, boolean fallback, boolean directIp,
-            long deadlineElapsed)
+            long deadlineElapsed, Set<String> triedAddresses, StringBuilder attempts)
             throws Exception {
-        InetAddress address = InetAddress.getByName(host);
-        List<Sample> valid = new ArrayList<>();
-        int attempted = 0;
-        int consecutiveTimeouts = 0;
-        while (attempted < SAMPLES_PER_SERVER
-                && SystemClock.elapsedRealtime() < deadlineElapsed) {
-            attempted++;
-            try {
-                Sample sample = singleExchange(address);
-                consecutiveTimeouts = 0;
-                if (sample != null) valid.add(sample);
-            } catch (SocketTimeoutException e) {
-                consecutiveTimeouts++;
-                if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS_PER_SERVER) break;
+        InetAddress[] addresses = InetAddress.getAllByName(host);
+        for (InetAddress address : addresses) {
+            String ip = address.getHostAddress();
+            if (!triedAddresses.add(ip)) continue;
+            List<Sample> valid = new ArrayList<>();
+            int attempted = 0;
+            int consecutiveTimeouts = 0;
+            while (attempted < SAMPLES_PER_SERVER
+                    && SystemClock.elapsedRealtime() < deadlineElapsed) {
+                attempted++;
+                try {
+                    Sample sample = singleExchange(address);
+                    consecutiveTimeouts = 0;
+                    if (sample != null) valid.add(sample);
+                } catch (SocketTimeoutException e) {
+                    consecutiveTimeouts++;
+                    if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS_PER_SERVER) break;
+                }
             }
+            if (valid.size() < MIN_VALID_SAMPLES) {
+                String outcome = consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS_PER_SERVER
+                    ? "超时无响应" : "有效样本不足 3 个";
+                recordAttempt(attempts, ip, outcome);
+                continue;
+            }
+            // Drop the worst-RTT samples, then take the median of what remains.
+            Collections.sort(valid, (a, b) -> Long.compare(a.rttMillis, b.rttMillis));
+            int keep = valid.size() - DISCARDED_WORST_SAMPLES;
+            if (keep < MIN_VALID_SAMPLES) keep = MIN_VALID_SAMPLES;
+            List<Sample> kept = valid.subList(0, keep);
+            double medianOffset = medianOffset(kept);
+            long medianRtt = medianRtt(kept);
+            recordAttempt(attempts, ip, "成功");
+            return new Result(true, host, fallback, directIp, Math.round(medianOffset),
+                Math.max(0L, medianRtt / 2), medianRtt, kept.size(), attempted,
+                SystemClock.elapsedRealtime(), null, null, null);
         }
-        if (valid.size() < MIN_VALID_SAMPLES) return null;
-        // Drop the worst-RTT samples, then take the median of what remains.
-        Collections.sort(valid, (a, b) -> Long.compare(a.rttMillis, b.rttMillis));
-        int keep = valid.size() - DISCARDED_WORST_SAMPLES;
-        if (keep < MIN_VALID_SAMPLES) keep = MIN_VALID_SAMPLES;
-        List<Sample> kept = valid.subList(0, keep);
-        double medianOffset = medianOffset(kept);
-        long medianRtt = medianRtt(kept);
-        return new Result(true, host, fallback, directIp, Math.round(medianOffset),
-            Math.max(0L, medianRtt / 2), medianRtt, kept.size(), attempted,
-            SystemClock.elapsedRealtime(), null, null, null);
+        return null;
     }
 
     /** Copy of a successful result with the full per-host attempt record attached. */
